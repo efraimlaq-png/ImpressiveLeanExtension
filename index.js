@@ -1141,7 +1141,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // BOTÃO: ENCERRAR EVENTO DEFINITIVO
+    //  BOTÃO: ENCERRAR EVENTO DEFINITIVO
     if (interaction.isButton() && interaction.customId.startsWith('end_event_')) {
         const idEvento = extrairIdEvento(interaction.customId, 'end_event_');
         let evento = obterEvento(idEvento, interaction);
