@@ -383,7 +383,7 @@ function gerarInterface(evento) {
     const embed = new EmbedBuilder()
         .setTitle(`⚔️ EVENTO: ${evento.nome.toUpperCase()}`)
         .setColor('#e67e22')
-        .setDescription(`👑 **Líder:** <@${evento.lider}>\n${textoRequisitosBuild(evento)}\n👥 **Capacidade por Grupo:** \`${evento.totalVagas}\`\n🧾 **Inscrições Totais:** \`${totalInscritos}\`\n\n*Escolha um bloco no menu abaixo para entrar.*`)
+        .setDescription(`👑 **Líder:** <@${evento.lider}>\n${textoRequisitosBuild(evento, configuracoesPorGuild.get(evento.guildId))}\n👥 **Capacidade por Grupo:** \`${evento.totalVagas}\`\n🧾 **Inscrições Totais:** \`${totalInscritos}\`\n\n*Escolha um bloco no menu abaixo para entrar.*`)
         .setFooter({ text: `Evento ID: ${evento.id}` });
 
     evento.grupos.forEach((g, i) => {
@@ -436,8 +436,69 @@ function valorCampoExibicao(valor) {
     return valor || '—';
 }
 
-function textoRequisitosBuild(evento) {
-    return `⚙️ **Tier dos Equipamentos:** \`${valorCampoExibicao(evento.tierEquipamento)}\`\n📊 **IP da Build:** \`${valorCampoExibicao(evento.ipBuild)}\``;
+function normalizarTituloBuildForum(valor) {
+    const texto = String(valor || '').trim();
+    if (!texto || VALORES_ANULADOS_CAMPO.test(texto)) return null;
+    return limitarTexto(texto, 100);
+}
+
+function obterReferenciaForumBuilds(configGuild) {
+    return configGuild?.canalForumBuildsId ? `<#${configGuild.canalForumBuildsId}>` : '*canal de fórum de builds do servidor*';
+}
+
+function textoRequisitosBuild(evento, configGuild = null) {
+    const linhas = [
+        `⚙️ **Tier dos Equipamentos:** \`${valorCampoExibicao(evento.tierEquipamento)}\``,
+        `📊 **IP da Build:** \`${valorCampoExibicao(evento.ipBuild)}\``
+    ];
+    if (evento.tituloBuildForum) {
+        linhas.push(`📚 **Build no fórum:** procure \`${evento.tituloBuildForum}\` em ${obterReferenciaForumBuilds(configGuild)}`);
+    }
+    return linhas.join('\n');
+}
+
+function gerarEmbedInstrucaoBuildParticipante(evento, configGuild, dadosInscricao = {}) {
+    const { grupo, horario, role, arma } = dadosInscricao;
+    const embed = new EmbedBuilder()
+        .setTitle(`📚 Build do evento: ${evento.nome}`)
+        .setColor('#9b59b6')
+        .setDescription(
+            `Você foi inscrito no evento **${evento.nome}**.\n` +
+            `Confira a build correta no fórum antes da raid.`
+        )
+        .addFields(
+            {
+                name: '🔎 Título para buscar no fórum',
+                value: `**\`${evento.tituloBuildForum}\`**\n*Formato padrão: Conteúdo - Numeração (ex: Baú Dourado - 01)*`,
+                inline: false
+            },
+            {
+                name: '📁 Onde procurar',
+                value: obterReferenciaForumBuilds(configGuild),
+                inline: false
+            }
+        );
+
+    if (grupo) {
+        embed.addFields({
+            name: '🛡️ Sua inscrição',
+            value: `**Grupo ${grupo}** — ${horario || '—'}\n**Função:** ${role || '—'} | **Arma:** ${arma || '—'}`,
+            inline: false
+        });
+    }
+
+    embed.addFields(
+        { name: '⚙️ Tier exigido', value: `\`${valorCampoExibicao(evento.tierEquipamento)}\``, inline: true },
+        { name: '📊 IP exigido', value: `\`${valorCampoExibicao(evento.ipBuild)}\``, inline: true }
+    );
+
+    return embed;
+}
+
+async function enviarDmInstrucaoBuildParticipante(userId, evento, configGuild, dadosInscricao = {}) {
+    if (!evento?.tituloBuildForum) return true;
+    const embed = gerarEmbedInstrucaoBuildParticipante(evento, configGuild, dadosInscricao);
+    return enviarDmUsuario(userId, { embeds: [embed] });
 }
 
 function dividirTextoDiscord(texto, limite = 1024) {
@@ -541,7 +602,7 @@ function gerarEmbedRegistroPreRaid(evento, indexGrupo) {
     const embed = new EmbedBuilder()
         .setTitle(`📋 Registro do Grupo ${idx + 1}: ${evento.nome}`)
         .setColor('#9b59b6')
-        .setDescription(`Resumo atual da composição para o bloco das **${grupo.horario}**.\n${textoRequisitosBuild(evento)}`);
+        .setDescription(`Resumo atual da composição para o bloco das **${grupo.horario}**.\n${textoRequisitosBuild(evento, configuracoesPorGuild.get(evento.guildId))}`);
 
     const participantesTexto = grupo.participantes.length
         ? grupo.participantes.map(p => `<@${p.id}> — **${p.role}** [${p.arma}]`).join('\n')
@@ -585,6 +646,7 @@ async function notificarPreRaidGrupo(guild, evento, indexGrupo) {
         .setColor('#3498db')
         .setDescription(`O **Grupo ${normalizarIndexGrupo(indexGrupo) + 1}** começa às **${grupo.horario}**.\nAs salas já foram abertas para os participantes registrados.`)
         .addFields(
+            { name: '📚 Build no fórum', value: evento.tituloBuildForum ? `\`${evento.tituloBuildForum}\`` : '—', inline: false },
             { name: '⚙️ Tier', value: `\`${valorCampoExibicao(evento.tierEquipamento)}\``, inline: true },
             { name: '📊 IP', value: `\`${valorCampoExibicao(evento.ipBuild)}\``, inline: true },
             { name: '🎧 Sala de Voz', value: grupo.canalVozId ? `<#${grupo.canalVozId}>` : '*Ainda não criada*', inline: true },
@@ -726,6 +788,7 @@ const comandoEvento = new SlashCommandBuilder()
     .addStringOption(opt => opt.setName('tier_equipamento').setDescription('Tier: 4.1-4.2 ou null se usar só IP').setRequired(true))
     .addStringOption(opt => opt.setName('ip_build').setDescription('IP: 1450 ou null se usar só Tier').setRequired(true))
     .addStringOption(opt => opt.setName('horarios').setDescription('Ex: 13:00, 14:00...').setRequired(true))
+    .addStringOption(opt => opt.setName('titulo_build').setDescription('Título no fórum de builds. Ex: Baú Dourado - 01').setRequired(true))
     .addStringOption(opt => opt.setName('armas_tank').setDescription('Ex: Maça, Fura-Bruma3').setRequired(false))
     .addStringOption(opt => opt.setName('armas_healer').setDescription('Ex: Sagrado, Natureza2').setRequired(false))
     .addStringOption(opt => opt.setName('armas_suporte').setDescription('Ex: Chama-sombra').setRequired(false))
@@ -738,7 +801,8 @@ const comandoConfiguracoes = new SlashCommandBuilder()
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addChannelOption(opt => opt.setName('categoria_canais').setDescription('Categoria').addChannelTypes(ChannelType.GuildCategory).setRequired(true))
     .addRoleOption(opt => opt.setName('cargo_evento').setDescription('Cargo permitido').setRequired(true))
-    .addChannelOption(opt => opt.setName('categoria_registros').setDescription('Categoria onde os relatórios finais temporários serão guardados').addChannelTypes(ChannelType.GuildCategory).setRequired(false));
+    .addChannelOption(opt => opt.setName('categoria_registros').setDescription('Categoria onde os relatórios finais temporários serão guardados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
+    .addChannelOption(opt => opt.setName('canal_forum_builds').setDescription('Canal fórum das builds (Conteúdo - 01, Baú Dourado - 01...)').addChannelTypes(ChannelType.GuildForum).setRequired(false));
 
 const comandoRanking = new SlashCommandBuilder()
     .setName('ranking')
@@ -754,8 +818,8 @@ async function registrarComandosSlash(rest, guildIds = []) {
     const opcoesEvento = (comandoEvento.toJSON().options || []).map(opt => opt.name);
     console.log(`📋 Opções do /evento (${opcoesEvento.length}): ${opcoesEvento.join(', ')}`);
 
-    if (!opcoesEvento.includes('tier_equipamento') || !opcoesEvento.includes('ip_build')) {
-        throw new Error('Definição do comando /evento inválida: faltam tier_equipamento ou ip_build no index1.js');
+    if (!opcoesEvento.includes('tier_equipamento') || !opcoesEvento.includes('ip_build') || !opcoesEvento.includes('titulo_build')) {
+        throw new Error('Definição do comando /evento inválida: faltam tier_equipamento, ip_build ou titulo_build');
     }
 
     const idsServidores = new Set(guildIds);
@@ -883,18 +947,23 @@ client.on('interactionCreate', async interaction => {
         const categoria = interaction.options.getChannel('categoria_canais');
         const cargoEvento = interaction.options.getRole('cargo_evento');
         const categoriaRegistros = interaction.options.getChannel('categoria_registros');
+        const canalForumBuilds = interaction.options.getChannel('canal_forum_builds');
         const configAtual = configuracoesPorGuild.get(interaction.guild.id) || {};
         configuracoesPorGuild.set(interaction.guild.id, {
             categoriaId: categoria.id,
             cargoEventoId: cargoEvento.id,
             categoriaRegistrosId: categoriaRegistros?.id || configAtual.categoriaRegistrosId || null,
+            canalForumBuildsId: canalForumBuilds?.id || configAtual.canalForumBuildsId || null,
             atualizadoPorId: interaction.user.id
         });
         salvarDados();
         const textoRegistros = categoriaRegistros
             ? `\n📁 Categoria de registros: <#${categoriaRegistros.id}>`
             : (configAtual.categoriaRegistrosId ? `\n📁 Categoria de registros mantida: <#${configAtual.categoriaRegistrosId}>` : '\n📁 Categoria de registros: não configurada');
-        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}`, ephemeral: true });
+        const textoForum = canalForumBuilds
+            ? `\n📚 Fórum de builds: <#${canalForumBuilds.id}>`
+            : (configAtual.canalForumBuildsId ? `\n📚 Fórum de builds mantido: <#${configAtual.canalForumBuildsId}>` : '\n📚 Fórum de builds: não configurado (configure para link na DM)');
+        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoForum}`, ephemeral: true });
     }
 
     // COMANDO /EVENTO
@@ -911,6 +980,13 @@ client.on('interactionCreate', async interaction => {
         if (!tierEquipamento && !ipBuild) {
             return interaction.reply({
                 content: '❌ Preencha **tier_equipamento** ou **ip_build** (pelo menos um). Para ignorar um campo, use `null` — ex: tier `4.1-4.2` e ip `null`, ou tier `null` e ip `1450`.',
+                ephemeral: true
+            });
+        }
+        const tituloBuildForum = normalizarTituloBuildForum(interaction.options.getString('titulo_build'));
+        if (!tituloBuildForum) {
+            return interaction.reply({
+                content: '❌ Informe **titulo_build** com o nome exato do tópico no fórum (ex: `Baú Dourado - 01`).',
                 ephemeral: true
             });
         }
@@ -937,7 +1013,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         const novoEvento = {
-            id: idEvento, nome, tierEquipamento, ipBuild, lider: lider.id, criadoPorId: interaction.user.id, guildId: interaction.guild.id, categoriaId: configGuild.categoriaId,
+            id: idEvento, nome, tierEquipamento, ipBuild, tituloBuildForum, lider: lider.id, criadoPorId: interaction.user.id, guildId: interaction.guild.id, categoriaId: configGuild.categoriaId,
             composicao, totalVagas, grupos, criadoEmMs: Date.now(), inicioPrevistoMs: iniciosPrevistosGrupos.length ? Math.min(...iniciosPrevistosGrupos) : null,
             inicioAtivoMs: null, mensagemPrincipalId: null, canalMensagemId: interaction.channel.id
         };
@@ -995,7 +1071,15 @@ client.on('interactionCreate', async interaction => {
         if (grupo.canalTextoId) await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
         await atualizarMensagemPrincipalEvento(interaction.guild, evento);
         salvarDados();
-        await interaction.update({ content: `✅ Registrado!`, components: [] });
+        const configGuildInscricao = configuracoesPorGuild.get(interaction.guild.id);
+        const dmBuildEnviada = await enviarDmInstrucaoBuildParticipante(interaction.user.id, evento, configGuildInscricao, {
+            grupo: indexGrupo + 1,
+            horario: grupo.horario,
+            role,
+            arma
+        });
+        const avisoDm = dmBuildEnviada ? '' : '\n⚠️ Não foi possível enviar a DM com o título da build (verifique se suas DMs estão abertas).';
+        await interaction.update({ content: `✅ Registrado!${avisoDm}`, components: [] });
     }
 
     // BOTÃO: ABRIR PAINEL PRIVADO DO LÍDER
@@ -1132,7 +1216,7 @@ client.on('interactionCreate', async interaction => {
         salvarDados();
 
         const embedSplit = new EmbedBuilder().setTitle(`⚖️ RELATÓRIO FINAL DE EVENTO - GRUPO ${parseInt(indexGrupo) + 1}`).setColor('#f1c40f');
-        embedSplit.setDescription(`${textoRequisitosBuild(evento)}\n💰 **Loot Total Arrecadado:** ${grupo.lootTotal.toLocaleString('pt-BR')} Pratas\n⏱️ **Soma do Tempo Total da PT:** ${formatarDuracaoMs(totalMsGeral)}\n\n*Os pontos de XP foram adicionados à conta de cada membro no banco de dados!*`);
+        embedSplit.setDescription(`${textoRequisitosBuild(evento, configuracoesPorGuild.get(interaction.guild.id))}\n💰 **Loot Total Arrecadado:** ${grupo.lootTotal.toLocaleString('pt-BR')} Pratas\n⏱️ **Soma do Tempo Total da PT:** ${formatarDuracaoMs(totalMsGeral)}\n\n*Os pontos de XP foram adicionados à conta de cada membro no banco de dados!*`);
         adicionarCampoLongo(embedSplit, 'Tabela de Distribuição e Pontuação', resultadosSplit.join('\n') || 'Sem jogadores.');
         if (falhasDmParticipantes.length > 0) {
             adicionarCampoLongo(embedSplit, '⚠️ DMs não entregues aos participantes', falhasDmParticipantes.map(id => `<@${id}>`).join(', '));
