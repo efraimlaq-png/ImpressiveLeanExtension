@@ -64,7 +64,7 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
 
 // ==========================================
 
-// BANCOS DE DADOS LOCAIS (JSON)
+//  BANCOS DE DADOS LOCAIS (JSON)
 
 // ==========================================
 
