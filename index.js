@@ -20,6 +20,7 @@ const xpMembros = new Map();
 const registrosCanais = new Map();
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID || null;
 const TIME_ZONE = process.env.TIME_ZONE || 'America/Sao_Paulo';
 const MINUTOS_ABERTURA_SALA = 30;
 const MAX_OPCOES_MENU = 25;
@@ -719,11 +720,11 @@ function usuarioPodeEncerrarMensagemAntiga(interaction, idEvento = null) {
 // ==========================================
 const comandoEvento = new SlashCommandBuilder()
     .setName('evento')
-    .setDescription('Cria evento com Split e acúmulo automático de XP por hora')
+    .setDescription('Cria evento com Split, Tier/IP da build e XP por hora')
     .addStringOption(opt => opt.setName('nome').setDescription('Nome da Raid/Evento').setRequired(true))
     .addUserOption(opt => opt.setName('lider').setDescription('Líder do evento').setRequired(true))
-    .addStringOption(opt => opt.setName('tier_equipamento').setDescription('Tier da build. Ex: 4.1-4.2 ou null se usar só IP').setRequired(false))
-    .addStringOption(opt => opt.setName('ip_build').setDescription('IP da build. Ex: 1450 ou IP: 1450. Use null se usar só Tier').setRequired(false))
+    .addStringOption(opt => opt.setName('tier_equipamento').setDescription('Tier: 4.1-4.2 ou null se usar só IP').setRequired(true))
+    .addStringOption(opt => opt.setName('ip_build').setDescription('IP: 1450 ou null se usar só Tier').setRequired(true))
     .addStringOption(opt => opt.setName('horarios').setDescription('Ex: 13:00, 14:00...').setRequired(true))
     .addStringOption(opt => opt.setName('armas_tank').setDescription('Ex: Maça, Fura-Bruma3').setRequired(false))
     .addStringOption(opt => opt.setName('armas_healer').setDescription('Ex: Sagrado, Natureza2').setRequired(false))
@@ -743,6 +744,34 @@ const comandoRanking = new SlashCommandBuilder()
     .setName('ranking')
     .setDescription('Mostra o Top 10 membros com mais XP de atividade no mês');
 
+const COMANDOS_SLASH_JSON = [
+    comandoEvento.toJSON(),
+    comandoConfiguracoes.toJSON(),
+    comandoRanking.toJSON()
+];
+
+async function registrarComandosSlash(rest, guildIds = []) {
+    const opcoesEvento = (comandoEvento.toJSON().options || []).map(opt => opt.name);
+    console.log(`📋 Opções do /evento (${opcoesEvento.length}): ${opcoesEvento.join(', ')}`);
+
+    if (!opcoesEvento.includes('tier_equipamento') || !opcoesEvento.includes('ip_build')) {
+        throw new Error('Definição do comando /evento inválida: faltam tier_equipamento ou ip_build no index1.js');
+    }
+
+    const idsServidores = new Set(guildIds);
+    if (GUILD_ID) idsServidores.add(GUILD_ID);
+
+    for (const guildId of idsServidores) {
+        await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guildId), { body: COMANDOS_SLASH_JSON });
+        console.log(`✅ Comandos do servidor ${guildId} atualizados (Tier e IP visíveis agora)`);
+    }
+
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: COMANDOS_SLASH_JSON });
+    console.log(idsServidores.size > 0
+        ? '✅ Comandos globais sincronizados'
+        : '⚠️ Defina GUILD_ID no .env ou adicione o bot a um servidor para atualização imediata');
+}
+
 // ==========================================
 // INICIALIZAÇÃO E CRON JOB
 // ==========================================
@@ -750,9 +779,12 @@ client.once('ready', async () => {
     console.log(`🤖 Bot online como ${client.user.tag}`);
     const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
     try {
-        await rest.put(Routes.applicationCommands(CLIENT_ID), { body: [comandoEvento.toJSON(), comandoConfiguracoes.toJSON(), comandoRanking.toJSON()] });
-        console.log('✅ Tudo Pronto! Sistema Completo Carregado!');
-    } catch (error) { console.error('Erro ao registrar comandos:', error); }
+        await registrarComandosSlash(rest, [...client.guilds.cache.keys()]);
+        console.log('✅ Sistema completo carregado!');
+    } catch (error) {
+        console.error('❌ Falha ao registrar comandos — Tier/IP não aparecerão no Discord:', error);
+        process.exit(1);
+    }
 
     agendarRegistrosSalvos();
 
@@ -1141,7 +1173,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    //  BOTÃO: ENCERRAR EVENTO DEFINITIVO
+    // BOTÃO: ENCERRAR EVENTO DEFINITIVO
     if (interaction.isButton() && interaction.customId.startsWith('end_event_')) {
         const idEvento = extrairIdEvento(interaction.customId, 'end_event_');
         let evento = obterEvento(idEvento, interaction);
