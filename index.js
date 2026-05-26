@@ -9,15 +9,17 @@ const cron = require('cron');
 const fs = require('fs');
 const path = require('path');
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages] });
 const eventosAtivos = new Map();
 const configuracoesPorGuild = new Map();
 const CONFIG_PATH = path.join(__dirname, 'guild-config.json');
 const XP_PATH = path.join(__dirname, 'xp-config.json');
 const REGISTROS_PATH = path.join(__dirname, 'registros-canais.json');
 const EVENTOS_PATH = path.join(__dirname, 'eventos-ativos.json');
+const SALDOS_PATH = path.join(__dirname, 'saldos-membros.json');
 const xpMembros = new Map();
 const registrosCanais = new Map();
+const saldosMembros = new Map();
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID || null;
@@ -25,7 +27,9 @@ const TIME_ZONE = process.env.TIME_ZONE || 'America/Sao_Paulo';
 const MINUTOS_ABERTURA_SALA = 30;
 const MAX_OPCOES_MENU = 25;
 const DIAS_RETENCAO_REGISTROS = 5;
+const DIAS_RETENCAO_REGISTROS_LEILAO = 30;
 const TEMPO_RETENCAO_REGISTROS_MS = DIAS_RETENCAO_REGISTROS * 24 * 60 * 60 * 1000;
+const TEMPO_RETENCAO_REGISTROS_LEILAO_MS = DIAS_RETENCAO_REGISTROS_LEILAO * 24 * 60 * 60 * 1000;
 
 if (!DISCORD_TOKEN || !CLIENT_ID) {
     console.error('Erro: configure DISCORD_TOKEN e CLIENT_ID no arquivo .env antes de iniciar o bot.');
@@ -66,6 +70,12 @@ function carregarDados() {
             });
         } catch (e) { console.error('Erro ao ler eventos-ativos.json', e); }
     }
+    if (fs.existsSync(SALDOS_PATH)) {
+        try {
+            const dados = JSON.parse(fs.readFileSync(SALDOS_PATH, 'utf8'));
+            Object.entries(dados).forEach(([chave, saldo]) => saldosMembros.set(chave, normalizarSaldoMembro(saldo)));
+        } catch (e) { console.error('Erro ao ler saldos-membros.json', e); }
+    }
 }
 
 function salvarDados() {
@@ -81,6 +91,9 @@ function salvarDados() {
 
         const objetoEventos = Object.fromEntries(eventosAtivos.entries());
         fs.writeFileSync(EVENTOS_PATH, JSON.stringify(objetoEventos, null, 2), 'utf8');
+
+        const objetoSaldos = Object.fromEntries(saldosMembros.entries());
+        fs.writeFileSync(SALDOS_PATH, JSON.stringify(objetoSaldos, null, 2), 'utf8');
     } catch (e) { console.error('Erro ao salvar arquivos de banco de dados locais', e); }
 }
 carregarDados();
@@ -106,6 +119,22 @@ function obterChaveXp(guildId, userId, date = new Date()) {
 function membroPodeCriarEvento(interaction, configGuild) {
     if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
     return Boolean(configGuild?.cargoEventoId && interaction.member?.roles?.cache?.has(configGuild.cargoEventoId));
+}
+
+function membroTemCargoLeilao(interaction, configGuild) {
+    if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
+    return Boolean(configGuild?.cargoLeilaoId && interaction.member?.roles?.cache?.has(configGuild.cargoLeilaoId));
+}
+
+async function usuarioPodeOperarLeilao(interaction, guildId) {
+    const configGuild = configuracoesPorGuild.get(guildId);
+    if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
+    if (interaction.member?.roles?.cache?.has(configGuild?.cargoLeilaoId)) return true;
+    if (!configGuild?.cargoLeilaoId) return false;
+
+    const guild = interaction.guild || client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+    const membro = guild ? await guild.members.fetch(interaction.user.id).catch(() => null) : null;
+    return Boolean(membro?.roles?.cache?.has(configGuild.cargoLeilaoId));
 }
 
 function horarioValido(horario) {
@@ -242,6 +271,220 @@ function tempoTotalAtual(participante) {
     return participante.totalMs + add;
 }
 
+function parseValorPrata(valor) {
+    return parseInt(String(valor || '0').replace(/\D/g, ''), 10) || 0;
+}
+
+function parsePercentualDesconto(valor, padrao = 20) {
+    const texto = String(valor ?? '').replace('%', '').replace(',', '.').trim();
+    const numero = Number.parseFloat(texto);
+    if (!Number.isFinite(numero)) return padrao;
+    return Math.min(100, Math.max(0, numero));
+}
+
+function formatarPercentual(valor) {
+    return `${parsePercentualDesconto(valor).toLocaleString('pt-BR', { maximumFractionDigits: 2 })}%`;
+}
+
+function formatarPrata(valor) {
+    return `${Math.max(0, Math.floor(Number(valor) || 0)).toLocaleString('pt-BR')} Pratas`;
+}
+
+function chaveSaldo(guildId, userId) {
+    return `${guildId}_${userId}`;
+}
+
+function normalizarSaldoMembro(saldo) {
+    const normalizado = {
+        guildId: saldo?.guildId || null,
+        userId: saldo?.userId || null,
+        lancamentos: Array.isArray(saldo?.lancamentos) ? saldo.lancamentos : [],
+        resgates: Array.isArray(saldo?.resgates) ? saldo.resgates : []
+    };
+
+    normalizado.lancamentos = normalizado.lancamentos.map(lancamento => ({
+        id: String(lancamento.id || ''),
+        guildId: lancamento.guildId || normalizado.guildId,
+        userId: lancamento.userId || normalizado.userId,
+        eventoId: lancamento.eventoId || null,
+        grupoIndex: Number.isInteger(lancamento.grupoIndex) ? lancamento.grupoIndex : parseInt(lancamento.grupoIndex ?? 0, 10),
+        tipo: lancamento.tipo || 'split',
+        descricao: lancamento.descricao || 'Split',
+        valor: Math.max(0, Math.floor(Number(lancamento.valor) || 0)),
+        status: lancamento.status || 'disponivel',
+        criadoEmMs: lancamento.criadoEmMs || Date.now(),
+        solicitadoEmMs: lancamento.solicitadoEmMs || null,
+        pagoEmMs: lancamento.pagoEmMs || null,
+        pagoPorId: lancamento.pagoPorId || null,
+        resgateId: lancamento.resgateId || null
+    })).filter(lancamento => lancamento.id);
+
+    normalizado.resgates = normalizado.resgates.map(resgate => ({
+        id: String(resgate.id || ''),
+        valorTotal: Math.max(0, Math.floor(Number(resgate.valorTotal) || 0)),
+        status: resgate.status || 'solicitado',
+        solicitadoEmMs: resgate.solicitadoEmMs || Date.now(),
+        pagoEmMs: resgate.pagoEmMs || null,
+        pagoPorId: resgate.pagoPorId || null,
+        lancamentoIds: Array.isArray(resgate.lancamentoIds) ? resgate.lancamentoIds : []
+    })).filter(resgate => resgate.id);
+
+    return normalizado;
+}
+
+function obterSaldoMembro(guildId, userId) {
+    const chave = chaveSaldo(guildId, userId);
+    const existente = saldosMembros.get(chave);
+    if (existente) return existente;
+    const novo = { guildId, userId, lancamentos: [], resgates: [] };
+    saldosMembros.set(chave, novo);
+    return novo;
+}
+
+function idLancamentoSacola(eventoId, indexGrupo, userId) {
+    return `sacola_${eventoId}_${normalizarIndexGrupo(indexGrupo)}_${userId}`;
+}
+
+function idLancamentoBau(eventoId, indexGrupo, userId) {
+    return `bau_${eventoId}_${normalizarIndexGrupo(indexGrupo)}_${userId}`;
+}
+
+function registrarLancamentoSaldo(guildId, userId, lancamento) {
+    if (!lancamento?.id || !lancamento.valor) return null;
+    const saldo = obterSaldoMembro(guildId, userId);
+    const atual = saldo.lancamentos.find(item => item.id === lancamento.id);
+    if (atual) {
+        Object.assign(atual, { ...lancamento, status: atual.status, resgateId: atual.resgateId, solicitadoEmMs: atual.solicitadoEmMs, pagoEmMs: atual.pagoEmMs, pagoPorId: atual.pagoPorId });
+        return atual;
+    }
+    const novo = {
+        guildId,
+        userId,
+        status: 'disponivel',
+        criadoEmMs: Date.now(),
+        solicitadoEmMs: null,
+        pagoEmMs: null,
+        pagoPorId: null,
+        resgateId: null,
+        ...lancamento
+    };
+    saldo.lancamentos.push(novo);
+    return novo;
+}
+
+function marcarLancamentoSaldoPago(guildId, userId, lancamentoId, pagoPorId) {
+    const saldo = obterSaldoMembro(guildId, userId);
+    const lancamento = saldo.lancamentos.find(item => item.id === lancamentoId);
+    if (!lancamento) return false;
+    lancamento.status = 'pago';
+    lancamento.pagoEmMs = Date.now();
+    lancamento.pagoPorId = pagoPorId;
+    if (lancamento.resgateId) {
+        const resgate = saldo.resgates.find(item => item.id === lancamento.resgateId);
+        const todosPagos = resgate?.lancamentoIds?.every(id => saldo.lancamentos.find(item => item.id === id)?.status === 'pago');
+        if (resgate && todosPagos) {
+            resgate.status = 'pago';
+            resgate.pagoEmMs = Date.now();
+            resgate.pagoPorId = pagoPorId;
+        }
+    }
+    return true;
+}
+
+function registrarSplitSacolaNoSaldo(evento, indexGrupo, resultado) {
+    if (!resultado?.valor) return null;
+    const idx = normalizarIndexGrupo(indexGrupo);
+    return registrarLancamentoSaldo(evento.guildId, resultado.userId, {
+        id: idLancamentoSacola(evento.id, idx, resultado.userId),
+        eventoId: evento.id,
+        grupoIndex: idx,
+        tipo: 'sacolas',
+        descricao: `Sacolas - ${evento.nome} | Grupo ${idx + 1}`,
+        valor: resultado.valor
+    });
+}
+
+function registrarSplitBauNoSaldo(evento, indexGrupo, resultado, origem) {
+    if (!resultado?.valor) return null;
+    const idx = normalizarIndexGrupo(indexGrupo);
+    return registrarLancamentoSaldo(evento.guildId, resultado.userId, {
+        id: idLancamentoBau(evento.id, idx, resultado.userId),
+        eventoId: evento.id,
+        grupoIndex: idx,
+        tipo: 'bau',
+        descricao: `${origem || 'Baú'} - ${evento.nome} | Grupo ${idx + 1}`,
+        valor: resultado.valor
+    });
+}
+
+function marcarSacolaPagaNoSaldo(evento, indexGrupo, userId, pagoPorId) {
+    return marcarLancamentoSaldoPago(evento.guildId, userId, idLancamentoSacola(evento.id, indexGrupo, userId), pagoPorId);
+}
+
+function obterSacolaTotal(grupo) {
+    return Math.max(0, Math.floor(Number(grupo?.sacolaTotal ?? grupo?.lootTotal ?? 0) || 0));
+}
+
+function definirSacolaTotal(grupo, valor) {
+    const total = Math.max(0, Math.floor(Number(valor) || 0));
+    grupo.sacolaTotal = total;
+    grupo.lootTotal = total;
+}
+
+function criarEstadoBauPadrao() {
+    return {
+        status: 'nao_informado',
+        printUrl: null,
+        localLoot: null,
+        descontoPercentual: 20,
+        valorBruto: 0,
+        valorReparo: 0,
+        valorLiquido: 0,
+        decisao: null,
+        compradorId: null,
+        valorPago: 0,
+        splitFinal: null,
+        leilao: null
+    };
+}
+
+function normalizarSplitSacolasPersistido(splitSacolas) {
+    if (!splitSacolas || typeof splitSacolas !== 'object') return null;
+    splitSacolas.resultados = Array.isArray(splitSacolas.resultados) ? splitSacolas.resultados : [];
+    splitSacolas.resultados.forEach(resultado => {
+        resultado.pago = Boolean(resultado.pago);
+        resultado.valor = Math.max(0, Math.floor(Number(resultado.valor) || 0));
+        resultado.tempoMs = Math.max(0, Math.floor(Number(resultado.tempoMs) || 0));
+        resultado.xpGanho = Number(resultado.xpGanho) || 0;
+    });
+    splitSacolas.totalSacolas = Math.max(0, Math.floor(Number(splitSacolas.totalSacolas) || 0));
+    splitSacolas.totalMs = Math.max(0, Math.floor(Number(splitSacolas.totalMs) || 0));
+    splitSacolas.falhasDmParticipantes = Array.isArray(splitSacolas.falhasDmParticipantes) ? splitSacolas.falhasDmParticipantes : [];
+    return splitSacolas;
+}
+
+function normalizarBauPersistido(bau) {
+    const normalizado = { ...criarEstadoBauPadrao(), ...(bau && typeof bau === 'object' ? bau : {}) };
+    normalizado.valorBruto = Math.max(0, Math.floor(Number(normalizado.valorBruto) || 0));
+    normalizado.valorReparo = Math.max(0, Math.floor(Number(normalizado.valorReparo) || 0));
+    normalizado.valorLiquido = Math.max(0, Math.floor(Number(normalizado.valorLiquido ?? (normalizado.valorBruto - normalizado.valorReparo)) || 0));
+    normalizado.valorPago = Math.max(0, Math.floor(Number(normalizado.valorPago) || 0));
+    normalizado.localLoot = normalizado.localLoot ? limitarTexto(normalizado.localLoot, 80) : null;
+    normalizado.descontoPercentual = parsePercentualDesconto(normalizado.descontoPercentual, 20);
+    if (normalizado.splitFinal?.resultados) {
+        normalizado.splitFinal.resultados = normalizado.splitFinal.resultados.map(resultado => ({
+            userId: resultado.userId,
+            tempoMs: Math.max(0, Math.floor(Number(resultado.tempoMs) || 0)),
+            valor: Math.max(0, Math.floor(Number(resultado.valor) || 0))
+        }));
+    }
+    if (normalizado.leilao) {
+        normalizado.leilao.lanceInicial = Math.max(0, Math.floor(Number(normalizado.leilao.lanceInicial) || 0));
+        normalizado.leilao.maiorLance = Math.max(0, Math.floor(Number(normalizado.leilao.maiorLance) || 0));
+    }
+    return normalizado;
+}
+
 function membroEstaNaSalaVoz(guild, grupo, userId) {
     if (!guild || !grupo?.canalVozId) return false;
     return guild.voiceStates.cache.get(userId)?.channelId === grupo.canalVozId;
@@ -271,6 +514,9 @@ function normalizarGrupoPersistido(grupo) {
     grupo.participantes = Array.isArray(grupo.participantes) ? grupo.participantes : [];
     grupo.participantes.forEach(p => { p.lastStartMs = null; });
     grupo.fechado = Boolean(grupo.fechado);
+    definirSacolaTotal(grupo, obterSacolaTotal(grupo));
+    grupo.splitSacolas = normalizarSplitSacolasPersistido(grupo.splitSacolas);
+    grupo.bau = normalizarBauPersistido(grupo.bau);
     grupo.conteudoEstado = grupo.conteudoEstado || 'aguardando';
     grupo.conteudoTempoAcumuladoMs = grupo.conteudoTempoAcumuladoMs || 0;
     if (grupo.conteudoEstado === 'rodando') {
@@ -373,12 +619,13 @@ function sincronizarCronometrosGrupo(guild, grupo) {
 function gerarDashboardGrupo(evento, indexGrupo) {
     const idx = normalizarIndexGrupo(indexGrupo);
     const grupo = evento.grupos[idx];
-    const lootFormatado = grupo.lootTotal.toLocaleString('pt-BR');
+    const sacolaFormatada = obterSacolaTotal(grupo).toLocaleString('pt-BR');
+    const statusBau = textoStatusBau(grupo);
 
     const embed = new EmbedBuilder()
         .setTitle(`🛡️ GERENCIAMENTO DE GRUPO: BLOCO ${idx + 1}`)
         .setColor(grupo.conteudoEstado === 'rodando' ? '#2ecc71' : '#95a5a6')
-        .setDescription(`**Horário Oficial:** ${grupo.horario}\n**Tempo de Conteúdo:** ⏱️ ${obterStatusConteudoGrupo(grupo)}\n**Loot Total Acumulado:** 💰 \`${lootFormatado} Pratas\`\n\n*O tempo só conta após o líder iniciar o conteúdo (Play).*`);
+        .setDescription(`**Horário Oficial:** ${grupo.horario}\n**Tempo de Conteúdo:** ⏱️ ${obterStatusConteudoGrupo(grupo)}\n**Sacolas/Prata Bruta:** 💰 \`${sacolaFormatada} Pratas\`\n**Baú:** ${statusBau}\n\n*O tempo só conta após o líder iniciar o conteúdo (Play).*`);
 
     let listagem = '';
     grupo.participantes.forEach(p => {
@@ -391,7 +638,7 @@ function gerarDashboardGrupo(evento, indexGrupo) {
 
     if (grupo.fechado) {
         embed.setColor('#7f8c8d');
-        embed.addFields({ name: '✅ Status', value: '*Split fechado. Este dashboard está bloqueado para novas alterações.*', inline: false });
+        embed.addFields({ name: '✅ Status', value: '*Split de sacolas fechado. Use o painel pós-fechamento para pagamentos e baú.*', inline: false });
         return { embeds: [embed], components: [] };
     }
 
@@ -411,8 +658,11 @@ function usuarioPodeGerenciarEvento(interaction, evento) {
 function gerarPainelLiderGrupo(evento, indexGrupo) {
     const idx = normalizarIndexGrupo(indexGrupo);
     const grupo = evento.grupos[idx];
-    if (!grupo || grupo.fechado) {
-        return { content: '❌ Este grupo já foi fechado ou não está disponível.', components: [], ephemeral: true };
+    if (!grupo) {
+        return { content: '❌ Este grupo não está disponível.', components: [], ephemeral: true };
+    }
+    if (grupo.fechado) {
+        return gerarPainelPagamentosGrupo(evento, idx);
     }
 
     const estadoConteudo = grupo.conteudoEstado || 'aguardando';
@@ -434,7 +684,7 @@ function gerarPainelLiderGrupo(evento, indexGrupo) {
     );
 
     const btnRowLider = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`dash_add_loot_${evento.id}_${idx}`).setLabel('Adicionar Valores (Split)').setEmoji('💰').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`dash_add_loot_${evento.id}_${idx}`).setLabel('Adicionar Sacolas').setEmoji('💰').setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId(`dash_calc_split_${evento.id}_${idx}`).setLabel('Finalizar & Calcular Split').setEmoji('⚖️').setStyle(ButtonStyle.Secondary)
     );
 
@@ -632,6 +882,486 @@ function adicionarCampoLongo(embed, nome, texto) {
     });
 }
 
+function urlImagemValida(url) {
+    return /^https?:\/\/\S+\.(png|jpe?g|webp|gif)(\?\S*)?$/i.test(String(url || '')) || /^https?:\/\/(?:cdn|media)\.discordapp\.(?:com|net)\/\S+/i.test(String(url || ''));
+}
+
+function textoStatusBau(grupo) {
+    const bau = grupo?.bau || criarEstadoBauPadrao();
+    if (bau.status === 'sem_bau') return '`Sem baú registrado`';
+    if (bau.status === 'aguardando_decisao') return `\`Aguardando decisão\` — Líquido estimado: **${formatarPrata(bau.valorLiquido)}**`;
+    if (bau.status === 'comprado_interno') return `\`Compra interna encerrada\` — **${formatarPrata(bau.valorPago)}** pagos por <@${bau.compradorId}>`;
+    if (bau.status === 'em_leilao') {
+        const canal = bau.leilao?.channelId ? `<#${bau.leilao.channelId}>` : 'canal não localizado';
+        const maiorLance = bau.leilao?.maiorLance ? ` — maior lance: **${formatarPrata(bau.leilao.maiorLance)}** por <@${bau.leilao.maiorLicitanteId}>` : '';
+        return `\`PENDENTE - EM LEILÃO\` em ${canal}${maiorLance}`;
+    }
+    if (bau.status === 'vendido_leilao') return `\`Leilão encerrado\` — **${formatarPrata(bau.valorPago)}** por <@${bau.compradorId}>`;
+    return '`Não informado`';
+}
+
+function calcularSplitValorPorTempo(grupo, valorTotal) {
+    const totalMs = grupo.splitSacolas?.totalMs || grupo.participantes.reduce((acc, p) => acc + (p.totalMs || 0), 0);
+    const total = Math.max(0, Math.floor(Number(valorTotal) || 0));
+    if (totalMs <= 0) return { total, totalMs: 0, resultados: [] };
+    return {
+        total,
+        totalMs,
+        resultados: grupo.participantes.map(p => ({
+            userId: p.id,
+            tempoMs: p.totalMs || 0,
+            valor: Math.floor(total * ((p.totalMs || 0) / totalMs))
+        }))
+    };
+}
+
+function gerarLinhasSplitSacolas(grupo) {
+    const resultados = grupo.splitSacolas?.resultados || [];
+    return resultados.map((resultado, index) => {
+        const status = resultado.pago ? '[ ✅ PAGO ]' : '[ ⏳ PENDENTE ]';
+        return `${index + 1}. ${status} <@${resultado.userId}> [${formatarDuracaoMs(resultado.tempoMs)}] ➜ **${formatarPrata(resultado.valor)}** *(+${Math.floor(resultado.xpGanho || 0)} XP)*`;
+    });
+}
+
+function gerarLinhasSplitValor(splitFinal) {
+    return (splitFinal?.resultados || []).map((resultado, index) => `${index + 1}. <@${resultado.userId}> [${formatarDuracaoMs(resultado.tempoMs)}] ➜ **${formatarPrata(resultado.valor)}**`);
+}
+
+function gerarEmbedRegistroEvento(evento, indexGrupo) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
+    const split = grupo.splitSacolas;
+    const embed = new EmbedBuilder()
+        .setTitle(`⚖️ REGISTRO DO EVENTO - GRUPO ${idx + 1}`)
+        .setColor(grupo.bau?.status === 'em_leilao' ? '#3498db' : '#f1c40f')
+        .setDescription(
+            `${textoRequisitosBuild(evento, configuracoesPorGuild.get(evento.guildId))}\n` +
+            `💰 **Sacolas/Prata Bruta:** ${formatarPrata(split?.totalSacolas ?? obterSacolaTotal(grupo))}\n` +
+            `⏱️ **Soma do Tempo Total da PT:** ${formatarDuracaoMs(split?.totalMs || 0)}\n` +
+            `📍 **Local do loot:** ${grupo.bau?.localLoot || 'não informado'}\n` +
+            `📦 **Baú:** ${textoStatusBau(grupo)}\n\n` +
+            '*Os pontos de XP foram adicionados à conta de cada membro no banco de dados.*'
+        );
+
+    adicionarCampoLongo(embed, 'Checklist de Pagamentos — Sacolas', gerarLinhasSplitSacolas(grupo).join('\n') || 'Sem jogadores.');
+
+    if (grupo.bau?.printUrl && urlImagemValida(grupo.bau.printUrl)) embed.setImage(grupo.bau.printUrl);
+
+    if (grupo.bau?.status === 'comprado_interno' || grupo.bau?.status === 'vendido_leilao') {
+        adicionarCampoLongo(embed, 'Distribuição do Baú', gerarLinhasSplitValor(grupo.bau.splitFinal).join('\n') || 'Sem distribuição registrada.');
+    } else if (grupo.bau?.status === 'em_leilao' && grupo.bau.leilao) {
+        const leilao = grupo.bau.leilao;
+        embed.addFields({
+            name: '[ ⏳ PENDENTE - EM LEILÃO ]',
+            value: [
+                `Canal: ${leilao.channelId ? `<#${leilao.channelId}>` : 'não localizado'}`,
+                `Desconto aplicado: **${formatarPercentual(grupo.bau.descontoPercentual)}**`,
+                `Lance inicial: **${formatarPrata(leilao.lanceInicial)}**`,
+                leilao.maiorLance ? `Maior lance: **${formatarPrata(leilao.maiorLance)}** por <@${leilao.maiorLicitanteId}>` : 'Maior lance: nenhum lance recebido'
+            ].join('\n'),
+            inline: false
+        });
+    }
+
+    if (split?.falhasDmParticipantes?.length > 0) {
+        adicionarCampoLongo(embed, '⚠️ DMs não entregues aos participantes', split.falhasDmParticipantes.map(id => `<@${id}>`).join(', '));
+    }
+
+    return embed;
+}
+
+function gerarComponentesAberturaPainelPosSplit(evento, indexGrupo) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`dash_payment_panel_${evento.id}_${idx}`).setLabel('Painel de Pagamentos').setEmoji('✅').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`dash_bau_panel_${evento.id}_${idx}`).setLabel('Gerenciar Baú').setEmoji('📦').setStyle(ButtonStyle.Secondary)
+        )
+    ];
+}
+
+function gerarPainelPagamentosGrupo(evento, indexGrupo) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
+    const resultados = grupo?.splitSacolas?.resultados || [];
+    if (!grupo?.splitSacolas) return { content: '❌ O split de sacolas ainda não foi fechado para este grupo.', components: [], ephemeral: true };
+
+    const linhas = gerarLinhasSplitSacolas(grupo);
+    const pendentes = resultados.filter(resultado => !resultado.pago).length;
+    const componentes = [];
+    const botoes = [];
+
+    botoes.push(
+        new ButtonBuilder()
+            .setCustomId(`dash_pay_all_sacola_${evento.id}_${idx}`)
+            .setLabel('Pay All')
+            .setEmoji('✅')
+            .setStyle(ButtonStyle.Success)
+            .setDisabled(pendentes === 0)
+    );
+
+    resultados.slice(0, 24).forEach((resultado, index) => {
+        botoes.push(
+            new ButtonBuilder()
+                .setCustomId(`dash_pay_sacola_${evento.id}_${idx}_${resultado.userId}`)
+                .setLabel(`${resultado.pago ? 'Pago' : 'Pagar'} #${index + 1}`)
+                .setStyle(resultado.pago ? ButtonStyle.Secondary : ButtonStyle.Primary)
+                .setDisabled(Boolean(resultado.pago))
+        );
+    });
+
+    for (let i = 0; i < botoes.length && componentes.length < 5; i += 5) {
+        componentes.push(new ActionRowBuilder().addComponents(botoes.slice(i, i + 5)));
+    }
+
+    const avisoLimite = resultados.length > 24 ? '\n⚠️ A lista tem mais de 24 membros; use **Pay All** para concluir todos de uma vez.' : '';
+    const resumo = dividirTextoDiscord(linhas.join('\n') || 'Sem jogadores.', 1800)[0];
+    return {
+        content: `👑 **Checklist de Pagamentos — Grupo ${idx + 1}**\nPendentes: **${pendentes}**\n\n${resumo}${avisoLimite}`,
+        components: componentes,
+        ephemeral: true
+    };
+}
+
+function gerarPainelBauGrupo(evento, indexGrupo) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
+    if (!grupo?.splitSacolas) return { content: '❌ Feche primeiro o split de sacolas do grupo.', components: [], ephemeral: true };
+    const bau = grupo.bau || criarEstadoBauPadrao();
+    const linhas = [
+        `📦 **Baú — Grupo ${idx + 1}**`,
+        `Status: ${textoStatusBau(grupo)}`,
+        `Local do loot: **${bau.localLoot || 'não informado'}**`,
+        `Desconto do leilão: **${formatarPercentual(bau.descontoPercentual)}**`,
+        `Valor bruto: **${formatarPrata(bau.valorBruto)}**`,
+        `Reparo: **${formatarPrata(bau.valorReparo)}**`,
+        `Líquido estimado: **${formatarPrata(bau.valorLiquido)}**`
+    ];
+    if (bau.printUrl) linhas.push(`Print: ${bau.printUrl}`);
+
+    if (bau.status === 'nao_informado' || bau.status === 'sem_bau') {
+        return {
+            content: `${linhas.join('\n')}\n\nEnvie o print do baú neste chat e use **Usar Último Print**, ou cole o link no formulário manual.`,
+            components: [
+                new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`dash_bau_ultimo_${evento.id}_${idx}`).setLabel('Usar Último Print').setEmoji('🖼️').setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder().setCustomId(`dash_bau_informar_${evento.id}_${idx}`).setLabel('Informar Dados').setEmoji('✏️').setStyle(ButtonStyle.Secondary),
+                    new ButtonBuilder().setCustomId(`dash_bau_sem_${evento.id}_${idx}`).setLabel('Sem Baú').setEmoji('🚫').setStyle(ButtonStyle.Secondary)
+                )
+            ],
+            ephemeral: true
+        };
+    }
+
+    if (bau.status === 'aguardando_decisao') {
+        return {
+            content: `${linhas.join('\n')}\n\nEscolha como o baú será tratado.`,
+            components: [
+                new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`dash_bau_buyout_${evento.id}_${idx}`).setLabel('Compra Interna').setEmoji('🤝').setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId(`dash_bau_leilao_${evento.id}_${idx}`).setLabel('Enviar para Leilão').setEmoji('🏷️').setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder().setCustomId(`dash_bau_informar_${evento.id}_${idx}`).setLabel('Corrigir Dados').setEmoji('✏️').setStyle(ButtonStyle.Secondary)
+                )
+            ],
+            ephemeral: true
+        };
+    }
+
+    return { content: linhas.join('\n'), components: [], ephemeral: true };
+}
+
+function criarModalBau(idEvento, indexGrupo, printUrl = '') {
+    const inputPrint = new TextInputBuilder()
+        .setCustomId('bau_print_url')
+        .setLabel('URL do print do baú')
+        .setPlaceholder('Cole o link do anexo/imagem do Discord')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false);
+    if (printUrl) inputPrint.setValue(limitarTexto(printUrl, 4000));
+
+    const modal = new ModalBuilder().setCustomId(`modal_bau_${idEvento}_${indexGrupo}`).setTitle('Dados do Baú');
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(inputPrint),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_local').setLabel('Local onde o loot está').setPlaceholder('Ex: Brecilia, Thetford, Martlock...').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_bruto').setLabel('Valor total estimado do loot').setPlaceholder('Ex: 5.500.000').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_reparo').setLabel('Valor estimado do reparo').setPlaceholder('Ex: 350.000').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_desconto').setLabel('Desconto para lance inicial (%)').setPlaceholder('Ex: 20 para 20%').setStyle(TextInputStyle.Short).setRequired(true))
+    );
+    return modal;
+}
+
+function criarModalBuyoutBau(evento, indexGrupo) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const bau = evento.grupos[idx].bau || criarEstadoBauPadrao();
+    const inputValor = new TextInputBuilder()
+        .setCustomId('bau_valor_pago')
+        .setLabel('Valor pago pelo baú')
+        .setPlaceholder('Ex: 4.000.000')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+    if (bau.valorLiquido > 0) inputValor.setValue(String(bau.valorLiquido));
+
+    const modal = new ModalBuilder().setCustomId(`modal_bau_buyout_${evento.id}_${idx}`).setTitle('Compra Interna do Baú');
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_comprador').setLabel('Comprador (menção ou ID)').setPlaceholder('@Membro ou ID do membro da PT').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(inputValor)
+    );
+    return modal;
+}
+
+async function buscarUltimoPrintBau(channel, userId) {
+    const mensagens = await channel.messages.fetch({ limit: 25 }).catch(() => null);
+    if (!mensagens) return null;
+    for (const mensagem of mensagens.values()) {
+        if (mensagem.author?.id !== userId) continue;
+        const anexo = mensagem.attachments.find(attachment => {
+            const nome = attachment.name || attachment.url || '';
+            return String(attachment.contentType || '').startsWith('image/') || /\.(png|jpe?g|webp|gif)$/i.test(nome);
+        });
+        if (anexo?.url) return anexo.url;
+    }
+    return null;
+}
+
+function extrairUserIdTexto(texto) {
+    return String(texto || '').match(/\d{15,25}/)?.[0] || null;
+}
+
+function calcularLanceInicial(valorLiquido, descontoPercentual = 20) {
+    const desconto = parsePercentualDesconto(descontoPercentual, 20);
+    return Math.floor(Math.max(0, Number(valorLiquido) || 0) * ((100 - desconto) / 100));
+}
+
+function gerarEmbedLeilao(evento, indexGrupo) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
+    const bau = grupo.bau || criarEstadoBauPadrao();
+    const leilao = bau.leilao || {};
+    const maiorLanceTexto = leilao.maiorLance ? `**${formatarPrata(leilao.maiorLance)}** por <@${leilao.maiorLicitanteId}>` : '*Nenhum lance recebido ainda.*';
+    const embed = new EmbedBuilder()
+        .setTitle(`🏷️ LEILÃO DE LOOT — ${evento.nome} | Grupo ${idx + 1}`)
+        .setColor(bau.status === 'vendido_leilao' ? '#2ecc71' : '#3498db')
+        .setDescription('Use o botão **Dar Lance** para registrar uma oferta. O painel será atualizado automaticamente com o maior lance.')
+        .addFields(
+            { name: 'Local do loot', value: bau.localLoot || 'não informado', inline: false },
+            { name: 'Valor bruto dos itens', value: formatarPrata(bau.valorBruto), inline: true },
+            { name: 'Reparo estimado', value: formatarPrata(bau.valorReparo), inline: true },
+            { name: 'Valor líquido estimado', value: formatarPrata(bau.valorLiquido), inline: true },
+            { name: `Lance inicial (-${formatarPercentual(bau.descontoPercentual)} do líquido)`, value: `**${formatarPrata(leilao.lanceInicial || calcularLanceInicial(bau.valorLiquido, bau.descontoPercentual))}**`, inline: false },
+            { name: 'Maior lance atual', value: maiorLanceTexto, inline: false }
+        )
+        .setFooter({ text: bau.status === 'vendido_leilao' ? 'Leilão encerrado.' : 'Lances abaixo do mínimo ou do maior lance atual serão recusados.' });
+    if (bau.printUrl && urlImagemValida(bau.printUrl)) embed.setImage(bau.printUrl);
+    return embed;
+}
+
+function gerarComponentesLeilao(evento, indexGrupo) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
+    const bau = grupo.bau || criarEstadoBauPadrao();
+    const encerrado = bau.status === 'vendido_leilao';
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`auction_bid_${evento.id}_${idx}`).setLabel('Dar Lance').setEmoji('💰').setStyle(ButtonStyle.Primary).setDisabled(encerrado),
+            new ButtonBuilder().setCustomId(`auction_close_${evento.id}_${idx}`).setLabel('Encerrar Leilão').setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(encerrado || !bau.leilao?.maiorLance)
+        )
+    ];
+}
+
+async function atualizarRegistroEvento(guild, evento, indexGrupo) {
+    const grupo = evento?.grupos?.[normalizarIndexGrupo(indexGrupo)];
+    if (!guild || !grupo?.splitSacolas) return;
+    const payload = { embeds: [gerarEmbedRegistroEvento(evento, indexGrupo)] };
+
+    if (grupo.splitSacolas.registroChannelId && grupo.splitSacolas.registroMessageId) {
+        const canalRegistro = guild.channels.cache.get(grupo.splitSacolas.registroChannelId) || await guild.channels.fetch(grupo.splitSacolas.registroChannelId).catch(() => null);
+        const msgRegistro = canalRegistro?.messages ? await canalRegistro.messages.fetch(grupo.splitSacolas.registroMessageId).catch(() => null) : null;
+        if (msgRegistro) await msgRegistro.edit(payload).catch(() => null);
+    }
+
+    if (grupo.splitSacolas.relatorioChannelId && grupo.splitSacolas.relatorioMessageId) {
+        const canalRelatorio = guild.channels.cache.get(grupo.splitSacolas.relatorioChannelId) || await guild.channels.fetch(grupo.splitSacolas.relatorioChannelId).catch(() => null);
+        const msgRelatorio = canalRelatorio?.messages ? await canalRelatorio.messages.fetch(grupo.splitSacolas.relatorioMessageId).catch(() => null) : null;
+        if (msgRelatorio) await msgRelatorio.edit(payload).catch(() => null);
+    }
+}
+
+function obterLeiloesAtivosUsuario(guildId, userId) {
+    const leiloes = [];
+    for (const [, evento] of eventosAtivos) {
+        if (evento.guildId !== guildId) continue;
+        evento.grupos.forEach((grupo, index) => {
+            if (grupo?.bau?.status !== 'em_leilao') return;
+            if (!grupo.participantes?.some(p => p.id === userId)) return;
+            leiloes.push({
+                eventoNome: evento.nome,
+                grupo: index + 1,
+                localLoot: grupo.bau.localLoot || 'não informado',
+                lanceAtual: grupo.bau.leilao?.maiorLance || grupo.bau.leilao?.lanceInicial || 0,
+                channelId: grupo.bau.leilao?.channelId || null
+            });
+        });
+    }
+    return leiloes;
+}
+
+function linhasLancamentosSaldo(lancamentos, limite = 8) {
+    const lista = lancamentos.slice(-limite).reverse();
+    return lista.map(item => `• **${formatarPrata(item.valor)}** — ${item.descricao}`);
+}
+
+function gerarEmbedSaldo(guildId, userId) {
+    const saldo = obterSaldoMembro(guildId, userId);
+    const disponiveis = saldo.lancamentos.filter(item => item.status === 'disponivel' && item.valor > 0);
+    const solicitados = saldo.lancamentos.filter(item => item.status === 'solicitado' && item.valor > 0);
+    const pagos = saldo.lancamentos.filter(item => item.status === 'pago' && item.valor > 0);
+    const leiloes = obterLeiloesAtivosUsuario(guildId, userId);
+    const totalDisponivel = disponiveis.reduce((acc, item) => acc + item.valor, 0);
+    const totalSolicitado = solicitados.reduce((acc, item) => acc + item.valor, 0);
+
+    const embed = new EmbedBuilder()
+        .setTitle('💼 Seu saldo de splits')
+        .setColor(totalDisponivel > 0 ? '#2ecc71' : '#95a5a6')
+        .setDescription(`Saldo disponível para resgate: **${formatarPrata(totalDisponivel)}**\nResgates aguardando pagamento: **${formatarPrata(totalSolicitado)}**`);
+
+    adicionarCampoLongo(embed, 'Disponível para resgate', linhasLancamentosSaldo(disponiveis).join('\n') || 'Nada disponível no momento.');
+    adicionarCampoLongo(embed, 'Pendente de pagamento', linhasLancamentosSaldo(solicitados).join('\n') || 'Nenhum resgate solicitado.');
+    adicionarCampoLongo(embed, 'Em leilão', leiloes.map(item => `• ${item.eventoNome} | Grupo ${item.grupo} | ${item.localLoot} | ${item.channelId ? `<#${item.channelId}>` : 'canal não localizado'} | referência: **${formatarPrata(item.lanceAtual)}**`).join('\n') || 'Nenhum baú seu está em leilão agora.');
+    adicionarCampoLongo(embed, 'Últimos pagos', linhasLancamentosSaldo(pagos, 5).join('\n') || 'Nenhum pagamento registrado.');
+    return embed;
+}
+
+function gerarComponentesSaldo(guildId, userId) {
+    const saldo = obterSaldoMembro(guildId, userId);
+    const totalDisponivel = saldo.lancamentos
+        .filter(item => item.status === 'disponivel' && item.valor > 0)
+        .reduce((acc, item) => acc + item.valor, 0);
+    return totalDisponivel > 0
+        ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`saldo_resgate_${guildId}_${userId}`).setLabel('Solicitar Resgate').setEmoji('💸').setStyle(ButtonStyle.Success))]
+        : [];
+}
+
+async function enviarDmResponsaveisLeilao(guild, configGuild, payload) {
+    if (!guild || !configGuild?.cargoLeilaoId) return 0;
+    const membros = guild.members.cache.filter(membro => membro.roles.cache.has(configGuild.cargoLeilaoId) && !membro.user.bot);
+
+    let enviados = 0;
+    for (const membro of membros.values()) {
+        const enviado = await enviarDmUsuario(membro.id, payload);
+        if (enviado) enviados++;
+    }
+    return enviados;
+}
+
+async function solicitarResgateSaldo(interaction, guildId, userId) {
+    if (interaction.user.id !== userId) {
+        return interaction.reply({ content: '❌ Você só pode solicitar resgate do seu próprio saldo.', ephemeral: true });
+    }
+
+    const guild = interaction.guild || client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+    const configGuild = configuracoesPorGuild.get(guildId);
+    if (!configGuild?.cargoLeilaoId) {
+        return interaction.reply({ content: '❌ O cargo responsável por leilões/resgates ainda não foi configurado em /configuracoes.', ephemeral: true });
+    }
+
+    const saldo = obterSaldoMembro(guildId, userId);
+    const disponiveis = saldo.lancamentos.filter(item => item.status === 'disponivel' && item.valor > 0);
+    if (disponiveis.length === 0) {
+        return interaction.update({ embeds: [gerarEmbedSaldo(guildId, userId)], components: gerarComponentesSaldo(guildId, userId) });
+    }
+    await interaction.deferUpdate();
+
+    const resgateId = Date.now().toString();
+    const valorTotal = disponiveis.reduce((acc, item) => acc + item.valor, 0);
+    disponiveis.forEach(item => {
+        item.status = 'solicitado';
+        item.solicitadoEmMs = Date.now();
+        item.resgateId = resgateId;
+    });
+    saldo.resgates.push({
+        id: resgateId,
+        valorTotal,
+        status: 'solicitado',
+        solicitadoEmMs: Date.now(),
+        pagoEmMs: null,
+        pagoPorId: null,
+        lancamentoIds: disponiveis.map(item => item.id)
+    });
+    salvarDados();
+
+    const embedPedido = new EmbedBuilder()
+        .setTitle('💸 Solicitação de resgate')
+        .setColor('#f1c40f')
+        .setDescription(`<@${userId}> solicitou resgate de **${formatarPrata(valorTotal)}**.`)
+        .addFields({ name: 'Itens incluídos', value: dividirTextoDiscord(disponiveis.map(item => `• ${item.descricao}: **${formatarPrata(item.valor)}**`).join('\n'), 1024)[0] })
+        .setFooter({ text: `Resgate ID: ${resgateId}` });
+    const componentes = [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`saldo_pagar_${guildId}_${userId}_${resgateId}`).setLabel('Marcar como Pago').setEmoji('✅').setStyle(ButtonStyle.Success))];
+
+    if (interaction.channel?.send) {
+        await interaction.channel.send({
+            content: `<@&${configGuild.cargoLeilaoId}> novo resgate solicitado por <@${userId}>.`,
+            embeds: [embedPedido],
+            components: componentes,
+            allowedMentions: { roles: [configGuild.cargoLeilaoId], users: [userId] }
+        }).catch(() => null);
+    }
+
+    const dmsEnviadas = await enviarDmResponsaveisLeilao(guild, configGuild, { embeds: [embedPedido], components: componentes });
+    await enviarDmUsuario(userId, { embeds: [new EmbedBuilder().setTitle('✅ Resgate solicitado').setColor('#2ecc71').setDescription(`Seu pedido de **${formatarPrata(valorTotal)}** foi enviado para o cargo responsável.`)] });
+
+    return interaction.editReply({
+        content: `✅ Resgate solicitado. DMs enviadas aos responsáveis: **${dmsEnviadas}**.`,
+        embeds: [gerarEmbedSaldo(guildId, userId)],
+        components: gerarComponentesSaldo(guildId, userId)
+    });
+}
+
+async function marcarResgateComoPago(interaction, guildId, userId, resgateId) {
+    const guild = interaction.guild || client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+    const podeOperar = await usuarioPodeOperarLeilao(interaction, guildId);
+    if (!podeOperar) return interaction.reply({ content: '❌ Apenas o cargo responsável por leilões/resgates pode marcar este resgate como pago.', ephemeral: true });
+
+    const saldo = obterSaldoMembro(guildId, userId);
+    const resgate = saldo.resgates.find(item => item.id === resgateId);
+    if (!resgate) return interaction.reply({ content: '❌ Resgate não encontrado.', ephemeral: true });
+    if (resgate.status === 'pago') return interaction.reply({ content: '✅ Este resgate já estava marcado como pago.', ephemeral: true });
+    await interaction.deferUpdate();
+
+    resgate.status = 'pago';
+    resgate.pagoEmMs = Date.now();
+    resgate.pagoPorId = interaction.user.id;
+
+    const eventosParaAtualizar = new Set();
+    saldo.lancamentos.forEach(lancamento => {
+        if (lancamento.resgateId !== resgateId) return;
+        lancamento.status = 'pago';
+        lancamento.pagoEmMs = Date.now();
+        lancamento.pagoPorId = interaction.user.id;
+        if (lancamento.tipo === 'sacolas' && lancamento.eventoId) {
+            const evento = eventosAtivos.get(lancamento.eventoId);
+            const grupo = evento?.grupos?.[normalizarIndexGrupo(lancamento.grupoIndex)];
+            const resultado = grupo?.splitSacolas?.resultados?.find(item => item.userId === userId);
+            if (resultado) {
+                resultado.pago = true;
+                resultado.pagoEmMs = Date.now();
+                resultado.pagoPorId = interaction.user.id;
+                eventosParaAtualizar.add(`${lancamento.eventoId}_${normalizarIndexGrupo(lancamento.grupoIndex)}`);
+            }
+        }
+    });
+
+    salvarDados();
+    for (const chave of eventosParaAtualizar) {
+        const [eventoId, grupoIndex] = chave.split('_');
+        const evento = eventosAtivos.get(eventoId);
+        if (evento && guild) await atualizarRegistroEvento(guild, evento, grupoIndex);
+    }
+
+    await enviarDmUsuario(userId, { embeds: [new EmbedBuilder().setTitle('✅ Resgate pago').setColor('#2ecc71').setDescription(`Seu resgate de **${formatarPrata(resgate.valorTotal)}** foi marcado como pago por <@${interaction.user.id}>.`)] });
+    const resposta = { content: `✅ Resgate de <@${userId}> marcado como pago: **${formatarPrata(resgate.valorTotal)}**.`, components: [] };
+    return interaction.editReply(resposta);
+}
+
 function gerarMenuRoles(idEvento, indexGrupo) {
     const evento = eventosAtivos.get(idEvento); const grupo = evento?.grupos[indexGrupo]; const options = [];
     if (!evento || !grupo || grupo.fechado) {
@@ -773,9 +1503,13 @@ async function notificarPreRaidGrupo(guild, evento, indexGrupo) {
 
 async function excluirCanalRegistro(registro) {
     try {
+        if (registro.apagarEmMs && Date.now() < registro.apagarEmMs) {
+            agendarExclusaoCanalRegistro(registro);
+            return;
+        }
         const guild = client.guilds.cache.get(registro.guildId) || await client.guilds.fetch(registro.guildId).catch(() => null);
         const canal = guild ? (guild.channels.cache.get(registro.channelId) || await guild.channels.fetch(registro.channelId).catch(() => null)) : null;
-        if (canal) await canal.delete('Registro temporário expirado após 5 dias.').catch(() => null);
+        if (canal) await canal.delete('Registro temporário expirado.').catch(() => null);
     } catch (error) {
         console.error('Erro ao excluir canal temporário de registro:', error);
     } finally {
@@ -795,6 +1529,22 @@ function agendarRegistrosSalvos() {
     for (const registro of registrosCanais.values()) agendarExclusaoCanalRegistro(registro);
 }
 
+async function estenderRetencaoRegistroLeilao(guild, grupo) {
+    const channelId = grupo?.splitSacolas?.registroChannelId;
+    if (!channelId) return false;
+    const registro = registrosCanais.get(channelId);
+    if (!registro) return false;
+    registro.apagarEmMs = Math.max(registro.apagarEmMs || 0, Date.now() + TEMPO_RETENCAO_REGISTROS_LEILAO_MS);
+    registro.retencaoEstendidaLeilao = true;
+    const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (canal?.setTopic) {
+        await canal.setTopic(`Registro temporário estendido por leilão aberto. Apaga automaticamente em até ${DIAS_RETENCAO_REGISTROS_LEILAO} dias.`).catch(() => null);
+    }
+    salvarDados();
+    agendarExclusaoCanalRegistro(registro);
+    return true;
+}
+
 async function criarCanalRegistroSplit(guild, evento, indexGrupo, embedSplit, configGuild) {
     if (!configGuild?.categoriaRegistrosId) return { criado: false, motivo: 'categoria_nao_configurada' };
 
@@ -811,7 +1561,7 @@ async function criarCanalRegistroSplit(guild, evento, indexGrupo, embedSplit, co
         topic: `Registro temporário do evento ${evento.nome}. Apaga automaticamente em ${DIAS_RETENCAO_REGISTROS} dias.`
     });
 
-    await canalRegistro.send({
+    const mensagemRegistro = await canalRegistro.send({
         content: `📌 Registro temporário do split. Este canal será apagado automaticamente em **${DIAS_RETENCAO_REGISTROS} dias**.`,
         embeds: [embedSplit]
     });
@@ -829,7 +1579,7 @@ async function criarCanalRegistroSplit(guild, evento, indexGrupo, embedSplit, co
     registrosCanais.set(canalRegistro.id, registro);
     salvarDados();
     agendarExclusaoCanalRegistro(registro);
-    return { criado: true, canalId: canalRegistro.id };
+    return { criado: true, canalId: canalRegistro.id, messageId: mensagemRegistro.id };
 }
 
 function gerarEmbedEventoEncerrado(userId, detalhe = 'Todas as salas vinculadas a este evento foram apagadas e os dados foram salvos.') {
@@ -877,6 +1627,10 @@ function usuarioPodeEncerrarMensagemAntiga(interaction, idEvento = null) {
     return false;
 }
 
+function eventoTemLeilaoAberto(evento) {
+    return Boolean(evento?.grupos?.some(grupo => grupo?.bau?.status === 'em_leilao'));
+}
+
 // ==========================================
 // COMANDOS DE BARRA (SLASH COMMANDS)
 // ==========================================
@@ -902,17 +1656,23 @@ const comandoConfiguracoes = new SlashCommandBuilder()
     .addChannelOption(opt => opt.setName('categoria_canais').setDescription('Categoria').addChannelTypes(ChannelType.GuildCategory).setRequired(true))
     .addRoleOption(opt => opt.setName('cargo_evento').setDescription('Cargo permitido').setRequired(true))
     .addChannelOption(opt => opt.setName('categoria_registros').setDescription('Categoria onde os relatórios finais temporários serão guardados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
-    .addChannelOption(opt => opt.setName('canal_forum_builds').setDescription('Canal fórum das builds (Conteúdo - 01, Baú Dourado - 01...)').addChannelTypes(ChannelType.GuildForum).setRequired(false))
-    .addChannelOption(opt => opt.setName('categoria_leiloes').setDescription('Categoria onde os canais de leilão gerados pelo bot serão alocados').addChannelTypes(ChannelType.GuildCategory).setRequired(false));
+    .addChannelOption(opt => opt.setName('categoria_leiloes').setDescription('Categoria onde os canais temporários de leilão serão criados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
+    .addRoleOption(opt => opt.setName('cargo_leiloes').setDescription('Cargo responsável por vendas, leilões e resgates').setRequired(false))
+    .addChannelOption(opt => opt.setName('canal_forum_builds').setDescription('Canal fórum das builds (Conteúdo - 01, Baú Dourado - 01...)').addChannelTypes(ChannelType.GuildForum).setRequired(false));
 
 const comandoRanking = new SlashCommandBuilder()
     .setName('ranking')
     .setDescription('Mostra o Top 10 membros com mais XP de atividade no mês');
 
+const comandoSaldo = new SlashCommandBuilder()
+    .setName('saldo')
+    .setDescription('Consulta seus splits, leilões pendentes e saldo disponível para resgate');
+
 const COMANDOS_SLASH_JSON = [
     comandoEvento.toJSON(),
     comandoConfiguracoes.toJSON(),
-    comandoRanking.toJSON()
+    comandoRanking.toJSON(),
+    comandoSaldo.toJSON()
 ];
 
 async function registrarComandosSlash(rest, guildIds = []) {
@@ -956,6 +1716,7 @@ client.once('ready', async () => {
     new cron.CronJob('* * * * *', async () => {
         for (const [idEvento, evento] of eventosAtivos) {
             const guild = client.guilds.cache.get(evento.guildId); if (!guild) continue;
+            if (evento.encerradoDefinitivo) continue;
             for (let i = 0; i < evento.grupos.length; i++) {
                 const grupo = evento.grupos[i];
                 sincronizarCronometrosGrupo(guild, grupo);
@@ -1042,17 +1803,32 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embedRank] });
     }
 
+    // COMANDO /SALDO
+    if (interaction.isChatInputCommand() && interaction.commandName === 'saldo') {
+        const guildId = interaction.guild.id;
+        const userId = interaction.user.id;
+        return interaction.reply({
+            embeds: [gerarEmbedSaldo(guildId, userId)],
+            components: gerarComponentesSaldo(guildId, userId),
+            ephemeral: true
+        });
+    }
+
     // COMANDO /CONFIGURACOES
     if (interaction.isChatInputCommand() && interaction.commandName === 'configuracoes') {
         const categoria = interaction.options.getChannel('categoria_canais');
         const cargoEvento = interaction.options.getRole('cargo_evento');
         const categoriaRegistros = interaction.options.getChannel('categoria_registros');
+        const categoriaLeiloes = interaction.options.getChannel('categoria_leiloes');
+        const cargoLeiloes = interaction.options.getRole('cargo_leiloes');
         const canalForumBuilds = interaction.options.getChannel('canal_forum_builds');
         const configAtual = configuracoesPorGuild.get(interaction.guild.id) || {};
         configuracoesPorGuild.set(interaction.guild.id, {
             categoriaId: categoria.id,
             cargoEventoId: cargoEvento.id,
             categoriaRegistrosId: categoriaRegistros?.id || configAtual.categoriaRegistrosId || null,
+            categoriaLeiloesId: categoriaLeiloes?.id || configAtual.categoriaLeiloesId || null,
+            cargoLeilaoId: cargoLeiloes?.id || configAtual.cargoLeilaoId || null,
             canalForumBuildsId: canalForumBuilds?.id || configAtual.canalForumBuildsId || null,
             atualizadoPorId: interaction.user.id
         });
@@ -1063,7 +1839,13 @@ client.on('interactionCreate', async interaction => {
         const textoForum = canalForumBuilds
             ? `\n📚 Fórum de builds: <#${canalForumBuilds.id}>`
             : (configAtual.canalForumBuildsId ? `\n📚 Fórum de builds mantido: <#${configAtual.canalForumBuildsId}>` : '\n📚 Fórum de builds: não configurado (configure para link na DM)');
-        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoForum}`, ephemeral: true });
+        const textoLeiloes = categoriaLeiloes
+            ? `\n🏷️ Categoria de leilões: <#${categoriaLeiloes.id}>`
+            : (configAtual.categoriaLeiloesId ? `\n🏷️ Categoria de leilões mantida: <#${configAtual.categoriaLeiloesId}>` : '\n🏷️ Categoria de leilões: não configurada');
+        const textoCargoLeiloes = cargoLeiloes
+            ? `\n🧾 Cargo responsável por leilões/resgates: <@&${cargoLeiloes.id}>`
+            : (configAtual.cargoLeilaoId ? `\n🧾 Cargo responsável por leilões/resgates mantido: <@&${configAtual.cargoLeilaoId}>` : '\n🧾 Cargo responsável por leilões/resgates: não configurado');
+        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoLeiloes}${textoCargoLeiloes}${textoForum}`, ephemeral: true });
     }
 
     // COMANDO /EVENTO
@@ -1111,7 +1893,7 @@ client.on('interactionCreate', async interaction => {
             if (inicioMs) iniciosPrevistosGrupos.push(inicioMs);
             grupos.push({
                 horario: horariosRaw[i], participantes: [], notificado: false, canalVozId: null, canalTextoId: null, dashboardMsgId: null,
-                inicioPrevistoMs: inicioMs, inicioAtivoMs: null, lootTotal: 0, fechado: false, fechadoEmMs: null,
+                inicioPrevistoMs: inicioMs, inicioAtivoMs: null, lootTotal: 0, sacolaTotal: 0, splitSacolas: null, bau: criarEstadoBauPadrao(), fechado: false, fechadoEmMs: null,
                 conteudoEstado: 'aguardando', conteudoTempoAcumuladoMs: 0, conteudoRodandoDesdeMs: null, conteudoInicioMs: null
             });
         }
@@ -1263,7 +2045,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // BOTÃO: ADICIONAR LOOT (MODAL)
+    // BOTÃO: ADICIONAR SACOLAS (MODAL)
     if (interaction.isButton() && interaction.customId.startsWith('dash_add_loot_')) {
         const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
         const evento = obterEvento(idEvento, interaction);
@@ -1271,29 +2053,27 @@ client.on('interactionCreate', async interaction => {
         if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Apenas o Líder.', ephemeral: true });
         const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!grupo || grupo.fechado) return interaction.reply({ content: '❌ Este grupo já foi fechado ou não está disponível.', ephemeral: true });
-        const modal = new ModalBuilder().setCustomId(`modal_loot_${idEvento}_${indexGrupo}`).setTitle('Lançamento de Split / Economia');
+        const modal = new ModalBuilder().setCustomId(`modal_sacolas_${idEvento}_${indexGrupo}`).setTitle('Lançamento de Sacolas');
         modal.addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('val_sacola').setLabel('Valor de Sacolas').setPlaceholder('Ex: 1.000.000').setStyle(TextInputStyle.Short).setRequired(false)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('val_bau').setLabel('Valor do Baú').setPlaceholder('Ex: 5.500.000').setStyle(TextInputStyle.Short).setRequired(false))
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('val_sacola').setLabel('Valor de Sacolas/Prata Bruta').setPlaceholder('Ex: 1.000.000').setStyle(TextInputStyle.Short).setRequired(true))
         );
         await interaction.showModal(modal);
     }
 
-    // RECEBIMENTO DO MODAL DE LOOT
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_loot_')) {
+    // RECEBIMENTO DO MODAL DE SACOLAS
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_sacolas_')) {
         const [, , idEvento, indexGrupo] = interaction.customId.split('_');
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!evento || !grupo || grupo.fechado) return interaction.reply({ content: '❌ Este grupo já foi fechado ou não está disponível.', ephemeral: true });
-        const getNum = (str) => parseInt((str || '0').replace(/\D/g, '')) || 0;
-        const addSacola = getNum(interaction.fields.getTextInputValue('val_sacola')); const addBau = getNum(interaction.fields.getTextInputValue('val_bau'));
-        grupo.lootTotal += (addSacola + addBau);
-        await interaction.reply({ content: `💰 **${(addSacola + addBau).toLocaleString('pt-BR')} Pratas** adicionadas!`, ephemeral: true });
+        const addSacola = parseValorPrata(interaction.fields.getTextInputValue('val_sacola'));
+        definirSacolaTotal(grupo, obterSacolaTotal(grupo) + addSacola);
+        await interaction.reply({ content: `💰 **${formatarPrata(addSacola)}** adicionadas às sacolas. Total atual: **${formatarPrata(obterSacolaTotal(grupo))}**.`, ephemeral: true });
         await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
         salvarDados();
     }
 
-    // BOTÃO: CALCULAR SPLIT, DM E XP
+    // BOTÃO: CALCULAR SPLIT DE SACOLAS, DM E XP
     if (interaction.isButton() && interaction.customId.startsWith('dash_calc_split_')) {
         const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
         const evento = obterEvento(idEvento, interaction);
@@ -1317,12 +2097,13 @@ client.on('interactionCreate', async interaction => {
         }
 
         const duracaoTotalTexto = formatarDuracaoMs(tempoConteudoAtual(grupo));
-        await interaction.reply({ content: '⏳ Processando o fechamento da PT, adicionando XP e enviando os recibos na DM...', ephemeral: true });
+        await interaction.reply({ content: '⏳ Processando o split de sacolas, adicionando XP e enviando os recibos na DM...', ephemeral: true });
         const falhasDmParticipantes = [];
+        const totalSacolas = obterSacolaTotal(grupo);
 
         const resultadosSplit = await Promise.all(grupo.participantes.map(async (p) => {
             const fraction = p.totalMs / totalMsGeral;
-            const ganho = Math.floor(grupo.lootTotal * fraction);
+            const ganho = Math.floor(totalSacolas * fraction);
 
             // CÁLCULO DE XP (50 XP por hora)
             const horasJogadas = p.totalMs / (1000 * 60 * 60);
@@ -1335,33 +2116,46 @@ client.on('interactionCreate', async interaction => {
             const dmEmbed = new EmbedBuilder()
                 .setTitle(`💰 Recibo de Raid & XP: ${evento.nome}`)
                 .setColor('#f1c40f')
-                .setDescription(`O fechamento do **Grupo ${parseInt(indexGrupo) + 1}** foi realizado! Seus pontos e valores foram computados.`)
+                .setDescription(`O split de **Sacolas/Prata Bruta** do **Grupo ${parseInt(indexGrupo) + 1}** foi realizado. O baú será tratado separadamente pelo líder.`)
                 .addFields(
                     { name: '⚙️ Tier', value: `\`${valorCampoExibicao(evento.tierEquipamento)}\``, inline: true },
                     { name: '📊 IP', value: `\`${valorCampoExibicao(evento.ipBuild)}\``, inline: true },
                     { name: '⏱️ Tempo da Raid', value: duracaoTotalTexto, inline: true },
                     { name: '⌛ Seu Tempo Ativo', value: formatarDuracaoMs(p.totalMs), inline: true },
                     { name: '⚡ XP Adquirido', value: `**+${Math.floor(xpGanho)} XP**`, inline: true },
-                    { name: '💎 Pratas a Receber', value: `**${ganho.toLocaleString('pt-BR')} Pratas**`, inline: false }
+                    { name: '💎 Sacolas a Receber', value: `**${formatarPrata(ganho)}**`, inline: false }
                 )
                 .setFooter({ text: 'Use o comando /ranking no servidor para ver o Placar do Mês!' });
 
             const dmEnviada = await enviarDmUsuario(p.id, { embeds: [dmEmbed] });
             if (!dmEnviada) falhasDmParticipantes.push(p.id);
 
-            return `<@${p.id}> [${formatarDuracaoMs(p.totalMs)}] ➜ **${ganho.toLocaleString('pt-BR')} Pratas** *(+${Math.floor(xpGanho)} XP)*`;
+            return {
+                userId: p.id,
+                tempoMs: p.totalMs,
+                valor: ganho,
+                xpGanho,
+                pago: false,
+                pagoEmMs: null,
+                pagoPorId: null
+            };
         }));
 
         grupo.fechado = true;
         grupo.fechadoEmMs = Date.now();
+        grupo.splitSacolas = {
+            totalSacolas,
+            totalMs: totalMsGeral,
+            calculadoEmMs: Date.now(),
+            calculadoPorId: interaction.user.id,
+            falhasDmParticipantes,
+            resultados: resultadosSplit
+        };
+        resultadosSplit.forEach(resultado => registrarSplitSacolaNoSaldo(evento, indexGrupo, resultado));
+        grupo.bau = normalizarBauPersistido(grupo.bau);
         salvarDados();
 
-        const embedSplit = new EmbedBuilder().setTitle(`⚖️ RELATÓRIO FINAL DE EVENTO - GRUPO ${parseInt(indexGrupo) + 1}`).setColor('#f1c40f');
-        embedSplit.setDescription(`${textoRequisitosBuild(evento, configuracoesPorGuild.get(interaction.guild.id))}\n💰 **Loot Total Arrecadado:** ${grupo.lootTotal.toLocaleString('pt-BR')} Pratas\n⏱️ **Soma do Tempo Total da PT:** ${formatarDuracaoMs(totalMsGeral)}\n\n*Os pontos de XP foram adicionados à conta de cada membro no banco de dados!*`);
-        adicionarCampoLongo(embedSplit, 'Tabela de Distribuição e Pontuação', resultadosSplit.join('\n') || 'Sem jogadores.');
-        if (falhasDmParticipantes.length > 0) {
-            adicionarCampoLongo(embedSplit, '⚠️ DMs não entregues aos participantes', falhasDmParticipantes.map(id => `<@${id}>`).join(', '));
-        }
+        const embedSplit = gerarEmbedRegistroEvento(evento, indexGrupo);
 
         const dmLiderEnviada = await enviarDmUsuario(evento.lider, { embeds: [embedSplit] });
         const configGuild = configuracoesPorGuild.get(interaction.guild.id);
@@ -1370,12 +2164,342 @@ client.on('interactionCreate', async interaction => {
             return { criado: false, motivo: 'erro_ao_criar' };
         });
 
-        await interaction.channel.send({ embeds: [embedSplit] });
+        if (registroSplit.criado) {
+            grupo.splitSacolas.registroChannelId = registroSplit.canalId;
+            grupo.splitSacolas.registroMessageId = registroSplit.messageId;
+        }
+
+        const msgRelatorio = await interaction.channel.send({
+            embeds: [gerarEmbedRegistroEvento(evento, indexGrupo)],
+            components: gerarComponentesAberturaPainelPosSplit(evento, indexGrupo)
+        });
+        grupo.splitSacolas.relatorioChannelId = interaction.channel.id;
+        grupo.splitSacolas.relatorioMessageId = msgRelatorio.id;
+        salvarDados();
+
         await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
         await interaction.followUp({
-            content: `✅ Fechamento concluído. DM do líder: **${dmLiderEnviada ? 'enviada' : 'não entregue'}**. DMs dos participantes com falha: **${falhasDmParticipantes.length}**. Registro: **${registroSplit.criado ? `criado em <#${registroSplit.canalId}>` : 'não criado'}**.`,
+            content: `✅ Split de sacolas concluído. DM do líder: **${dmLiderEnviada ? 'enviada' : 'não entregue'}**. DMs dos participantes com falha: **${falhasDmParticipantes.length}**. Registro: **${registroSplit.criado ? `criado em <#${registroSplit.canalId}>` : 'não criado'}**.\n📦 Agora use **Gerenciar Baú** no relatório para informar print, valor bruto e reparo.`,
             ephemeral: true
         });
+    }
+
+    // PAINEL PÓS-FECHAMENTO: PAGAMENTOS DE SACOLAS
+    if (interaction.isButton() && interaction.customId.startsWith('dash_payment_panel_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode abrir este painel.', ephemeral: true });
+        return interaction.reply(gerarPainelPagamentosGrupo(evento, indexGrupo));
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('dash_pay_sacola_')) {
+        const [, , , idEvento, indexGrupo, userId] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode confirmar pagamentos.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        const resultado = grupo?.splitSacolas?.resultados?.find(item => item.userId === userId);
+        if (!resultado) return interaction.reply({ content: '❌ Participante não encontrado no checklist.', ephemeral: true });
+        resultado.pago = true;
+        resultado.pagoEmMs = Date.now();
+        resultado.pagoPorId = interaction.user.id;
+        marcarSacolaPagaNoSaldo(evento, indexGrupo, userId, interaction.user.id);
+        salvarDados();
+        await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        return interaction.update(gerarPainelPagamentosGrupo(evento, indexGrupo));
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('dash_pay_all_sacola_')) {
+        const [, , , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode confirmar pagamentos.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        if (!grupo?.splitSacolas) return interaction.reply({ content: '❌ Checklist de sacolas não encontrado.', ephemeral: true });
+        grupo.splitSacolas.resultados.forEach(resultado => {
+            if (!resultado.pago) {
+                resultado.pago = true;
+                resultado.pagoEmMs = Date.now();
+                resultado.pagoPorId = interaction.user.id;
+                marcarSacolaPagaNoSaldo(evento, indexGrupo, resultado.userId, interaction.user.id);
+            }
+        });
+        salvarDados();
+        await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        return interaction.update(gerarPainelPagamentosGrupo(evento, indexGrupo));
+    }
+
+    // PAINEL PÓS-FECHAMENTO: BAÚ
+    if (interaction.isButton() && interaction.customId.startsWith('dash_bau_panel_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
+        return interaction.reply(gerarPainelBauGrupo(evento, indexGrupo));
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('dash_bau_informar_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
+        return interaction.showModal(criarModalBau(idEvento, indexGrupo));
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('dash_bau_ultimo_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
+        const printUrl = await buscarUltimoPrintBau(interaction.channel, interaction.user.id);
+        if (!printUrl) return interaction.reply({ content: '❌ Não encontrei imagem recente enviada por você neste canal. Envie o print do baú e tente novamente.', ephemeral: true });
+        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrl));
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('dash_bau_sem_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        grupo.bau = { ...criarEstadoBauPadrao(), status: 'sem_bau', decisao: 'sem_bau' };
+        salvarDados();
+        await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        return interaction.update(gerarPainelBauGrupo(evento, indexGrupo));
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_bau_') && !interaction.customId.startsWith('modal_bau_buyout_')) {
+        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        if (!grupo?.splitSacolas) return interaction.reply({ content: '❌ Feche primeiro o split de sacolas.', ephemeral: true });
+        const valorBruto = parseValorPrata(interaction.fields.getTextInputValue('bau_valor_bruto'));
+        const valorReparo = parseValorPrata(interaction.fields.getTextInputValue('bau_valor_reparo'));
+        const printUrl = String(interaction.fields.getTextInputValue('bau_print_url') || '').trim() || null;
+        const localLoot = limitarTexto(String(interaction.fields.getTextInputValue('bau_local') || '').trim(), 80);
+        const descontoPercentual = parsePercentualDesconto(interaction.fields.getTextInputValue('bau_desconto'), 20);
+        grupo.bau = {
+            ...criarEstadoBauPadrao(),
+            status: 'aguardando_decisao',
+            printUrl,
+            localLoot,
+            descontoPercentual,
+            valorBruto,
+            valorReparo,
+            valorLiquido: Math.max(0, valorBruto - valorReparo),
+            informadoEmMs: Date.now(),
+            informadoPorId: interaction.user.id
+        };
+        salvarDados();
+        await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        return interaction.reply(gerarPainelBauGrupo(evento, indexGrupo));
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('dash_bau_buyout_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        if (grupo?.bau?.status !== 'aguardando_decisao') return interaction.reply({ content: '❌ Informe os dados do baú antes de registrar compra interna.', ephemeral: true });
+        return interaction.showModal(criarModalBuyoutBau(evento, indexGrupo));
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_bau_buyout_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        if (grupo?.bau?.status !== 'aguardando_decisao') return interaction.reply({ content: '❌ Este baú não está aguardando decisão.', ephemeral: true });
+        const compradorId = extrairUserIdTexto(interaction.fields.getTextInputValue('bau_comprador'));
+        if (!compradorId || !grupo.participantes.some(p => p.id === compradorId)) {
+            return interaction.reply({ content: '❌ Informe a menção ou ID de um membro da própria PT.', ephemeral: true });
+        }
+        const valorPago = parseValorPrata(interaction.fields.getTextInputValue('bau_valor_pago'));
+        if (valorPago <= 0) return interaction.reply({ content: '❌ Informe um valor pago maior que zero.', ephemeral: true });
+
+        const splitFinal = calcularSplitValorPorTempo(grupo, valorPago);
+        grupo.bau.status = 'comprado_interno';
+        grupo.bau.decisao = 'buyout';
+        grupo.bau.compradorId = compradorId;
+        grupo.bau.valorPago = valorPago;
+        grupo.bau.splitFinal = splitFinal;
+        grupo.bau.encerradoEmMs = Date.now();
+        grupo.bau.encerradoPorId = interaction.user.id;
+        splitFinal.resultados.forEach(resultado => registrarSplitBauNoSaldo(evento, indexGrupo, resultado, 'Baú compra interna'));
+        salvarDados();
+
+        for (const resultado of splitFinal.resultados) {
+            const dmEmbed = new EmbedBuilder()
+                .setTitle(`📦 Split do Baú: ${evento.nome}`)
+                .setColor('#2ecc71')
+                .setDescription(`O baú do **Grupo ${parseInt(indexGrupo) + 1}** foi comprado internamente por <@${compradorId}>.`)
+                .addFields(
+                    { name: 'Valor pago', value: formatarPrata(valorPago), inline: true },
+                    { name: 'Sua parte', value: `**${formatarPrata(resultado.valor)}**`, inline: true }
+                );
+            await enviarDmUsuario(resultado.userId, { embeds: [dmEmbed] });
+        }
+
+        await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        await interaction.channel.send({ embeds: [gerarEmbedRegistroEvento(evento, indexGrupo)] }).catch(() => null);
+        return interaction.reply({ content: `✅ Compra interna registrada. O baú foi splitado em **${formatarPrata(valorPago)}**.`, ephemeral: true });
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('dash_bau_leilao_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode enviar o baú para leilão.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        const bau = grupo?.bau;
+        if (bau?.status !== 'aguardando_decisao') return interaction.reply({ content: '❌ Informe os dados do baú antes de iniciar o leilão.', ephemeral: true });
+        if (!bau.printUrl || !urlImagemValida(bau.printUrl)) return interaction.reply({ content: '❌ Informe um print válido do baú antes de criar o leilão.', ephemeral: true });
+        if (bau.valorLiquido <= 0) return interaction.reply({ content: '❌ O valor líquido precisa ser maior que zero para iniciar leilão.', ephemeral: true });
+
+        const configGuild = configuracoesPorGuild.get(interaction.guild.id);
+        if (!configGuild?.categoriaLeiloesId) return interaction.reply({ content: '❌ Configure a **categoria_leiloes** em /configuracoes antes de enviar baús para leilão.', ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+
+        const categoria = interaction.guild.channels.cache.get(configGuild.categoriaLeiloesId) || await interaction.guild.channels.fetch(configGuild.categoriaLeiloesId).catch(() => null);
+        if (!categoria || categoria.type !== ChannelType.GuildCategory) return interaction.editReply({ content: '❌ Categoria de leilões inválida ou inacessível.' });
+
+        const idx = normalizarIndexGrupo(indexGrupo);
+        const slugEvento = criarSlug(evento.nome);
+        const permissionOverwrites = [];
+        if (configGuild.cargoLeilaoId) {
+            permissionOverwrites.push({
+                id: configGuild.cargoLeilaoId,
+                allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages]
+            });
+        }
+        const opcoesCanalLeilao = {
+            name: `leilao-g${idx + 1}-${slugEvento}`.slice(0, 95),
+            type: ChannelType.GuildText,
+            parent: categoria.id,
+            topic: `Leilão temporário do baú do evento ${evento.nome} | Grupo ${idx + 1}`
+        };
+        if (permissionOverwrites.length > 0) opcoesCanalLeilao.permissionOverwrites = permissionOverwrites;
+        const canalLeilao = await interaction.guild.channels.create(opcoesCanalLeilao);
+
+        bau.status = 'em_leilao';
+        bau.decisao = 'leilao';
+        bau.leilao = {
+            channelId: canalLeilao.id,
+            messageId: null,
+            lanceInicial: calcularLanceInicial(bau.valorLiquido, bau.descontoPercentual),
+            maiorLance: 0,
+            maiorLicitanteId: null,
+            criadoEmMs: Date.now(),
+            criadoPorId: interaction.user.id
+        };
+
+        const msgLeilao = await canalLeilao.send({
+            content: `🏷️ **Leilão aberto para o baú do evento ${evento.nome} — Grupo ${idx + 1}.**${configGuild.cargoLeilaoId ? `\nResponsáveis: <@&${configGuild.cargoLeilaoId}>` : ''}`,
+            embeds: [gerarEmbedLeilao(evento, indexGrupo)],
+            components: gerarComponentesLeilao(evento, indexGrupo),
+            allowedMentions: configGuild.cargoLeilaoId ? { roles: [configGuild.cargoLeilaoId] } : undefined
+        });
+        bau.leilao.messageId = msgLeilao.id;
+        salvarDados();
+        await estenderRetencaoRegistroLeilao(interaction.guild, grupo);
+        await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        return interaction.editReply({ content: `✅ Leilão criado em <#${canalLeilao.id}> com lance inicial de **${formatarPrata(bau.leilao.lanceInicial)}**.` });
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('auction_bid_')) {
+        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
+        if (!evento || grupo?.bau?.status !== 'em_leilao') return interaction.reply({ content: '❌ Este leilão não está ativo.', ephemeral: true });
+        const modal = new ModalBuilder().setCustomId(`modal_auction_bid_${idEvento}_${indexGrupo}`).setTitle('Dar Lance');
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('valor_lance').setLabel('Valor do lance').setPlaceholder('Ex: 4.800.000').setStyle(TextInputStyle.Short).setRequired(true))
+        );
+        return interaction.showModal(modal);
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_auction_bid_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
+        const leilao = grupo?.bau?.leilao;
+        if (!evento || grupo?.bau?.status !== 'em_leilao' || !leilao) return interaction.reply({ content: '❌ Este leilão não está ativo.', ephemeral: true });
+        const valorLance = parseValorPrata(interaction.fields.getTextInputValue('valor_lance'));
+        if (valorLance < leilao.lanceInicial) return interaction.reply({ content: `❌ O lance mínimo é **${formatarPrata(leilao.lanceInicial)}**.`, ephemeral: true });
+        if (leilao.maiorLance && valorLance <= leilao.maiorLance) return interaction.reply({ content: `❌ O lance precisa superar o atual: **${formatarPrata(leilao.maiorLance)}**.`, ephemeral: true });
+
+        leilao.maiorLance = valorLance;
+        leilao.maiorLicitanteId = interaction.user.id;
+        leilao.atualizadoEmMs = Date.now();
+        salvarDados();
+
+        const canalLeilao = interaction.guild.channels.cache.get(leilao.channelId) || await interaction.guild.channels.fetch(leilao.channelId).catch(() => null);
+        const msgLeilao = canalLeilao?.messages ? await canalLeilao.messages.fetch(leilao.messageId).catch(() => null) : null;
+        if (msgLeilao) await msgLeilao.edit({ embeds: [gerarEmbedLeilao(evento, indexGrupo)], components: gerarComponentesLeilao(evento, indexGrupo) }).catch(() => null);
+        await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        return interaction.reply({ content: `✅ Lance registrado: **${formatarPrata(valorLance)}**.`, ephemeral: true });
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('auction_close_')) {
+        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        const ehAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+        const podeOperarLeilao = await usuarioPodeOperarLeilao(interaction, evento.guildId);
+        if (!usuarioPodeGerenciarEvento(interaction, evento) && !ehAdmin && !podeOperarLeilao) return interaction.reply({ content: '❌ Apenas o líder, criador do evento, administrador ou cargo responsável por leilões pode encerrar o leilão.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        const leilao = grupo?.bau?.leilao;
+        if (grupo?.bau?.status !== 'em_leilao' || !leilao) return interaction.reply({ content: '❌ Este leilão não está ativo.', ephemeral: true });
+        if (!leilao.maiorLance || !leilao.maiorLicitanteId) return interaction.reply({ content: '❌ Ainda não há lance para encerrar este leilão.', ephemeral: true });
+
+        const splitFinal = calcularSplitValorPorTempo(grupo, leilao.maiorLance);
+        grupo.bau.status = 'vendido_leilao';
+        grupo.bau.decisao = 'leilao';
+        grupo.bau.compradorId = leilao.maiorLicitanteId;
+        grupo.bau.valorPago = leilao.maiorLance;
+        grupo.bau.splitFinal = splitFinal;
+        grupo.bau.encerradoEmMs = Date.now();
+        grupo.bau.encerradoPorId = interaction.user.id;
+        splitFinal.resultados.forEach(resultado => registrarSplitBauNoSaldo(evento, indexGrupo, resultado, 'Baú leiloado'));
+        salvarDados();
+
+        const msgLeilao = await interaction.channel.messages.fetch(leilao.messageId).catch(() => null);
+        if (msgLeilao) await msgLeilao.edit({ embeds: [gerarEmbedLeilao(evento, indexGrupo)], components: gerarComponentesLeilao(evento, indexGrupo) }).catch(() => null);
+
+        for (const resultado of splitFinal.resultados) {
+            const dmEmbed = new EmbedBuilder()
+                .setTitle(`📦 Split do Baú Leiloado: ${evento.nome}`)
+                .setColor('#2ecc71')
+                .setDescription(`O leilão do baú do **Grupo ${parseInt(indexGrupo) + 1}** foi encerrado.`)
+                .addFields(
+                    { name: 'Vencedor', value: `<@${leilao.maiorLicitanteId}>`, inline: true },
+                    { name: 'Valor final', value: formatarPrata(leilao.maiorLance), inline: true },
+                    { name: 'Sua parte', value: `**${formatarPrata(resultado.valor)}**`, inline: false }
+                );
+            await enviarDmUsuario(resultado.userId, { embeds: [dmEmbed] });
+        }
+
+        await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        await interaction.channel.send({ embeds: [gerarEmbedRegistroEvento(evento, indexGrupo)] }).catch(() => null);
+        return interaction.reply({ content: `✅ Leilão encerrado por **${formatarPrata(leilao.maiorLance)}**. Registro atualizado.`, ephemeral: true });
+    }
+
+    // SALDO: SOLICITAÇÃO E PAGAMENTO DE RESGATE
+    if (interaction.isButton() && interaction.customId.startsWith('saldo_resgate_')) {
+        const resto = interaction.customId.slice('saldo_resgate_'.length);
+        const [guildId, userId] = resto.split('_');
+        return solicitarResgateSaldo(interaction, guildId, userId);
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('saldo_pagar_')) {
+        const resto = interaction.customId.slice('saldo_pagar_'.length);
+        const [guildId, userId, resgateId] = resto.split('_');
+        return marcarResgateComoPago(interaction, guildId, userId, resgateId);
     }
 
     // BOTÃO: SAIR DO EVENTO
@@ -1420,14 +2544,27 @@ client.on('interactionCreate', async interaction => {
             return interaction.reply({ content: '❌ Apenas o administrador, o líder ou quem criou o evento pode encerrá-lo.', ephemeral: true });
         }
 
+        const manterPorLeilaoAberto = eventoTemLeilaoAberto(evento);
         for (const grupo of evento.grupos) {
             if (grupo.canalVozId) await interaction.guild.channels.cache.get(grupo.canalVozId)?.delete().catch(() => null);
             if (grupo.canalTextoId) await interaction.guild.channels.cache.get(grupo.canalTextoId)?.delete().catch(() => null);
+            grupo.canalVozId = null;
+            grupo.canalTextoId = null;
+            grupo.dashboardMsgId = null;
         }
 
-        removerEventoPersistido(idEvento);
+        if (manterPorLeilaoAberto) {
+            evento.encerradoDefinitivo = true;
+            evento.encerradoDefinitivoEmMs = Date.now();
+            salvarDados();
+        } else {
+            removerEventoPersistido(idEvento);
+        }
 
-        await interaction.update({ embeds: [gerarEmbedEventoEncerrado(interaction.user.id)], components: [] });
+        const detalhe = manterPorLeilaoAberto
+            ? 'As salas do evento foram apagadas, mas o registro ficou armazenado por causa de leilão em aberto. O split do baú continuará funcionando no canal de leilão.'
+            : undefined;
+        await interaction.update({ embeds: [gerarEmbedEventoEncerrado(interaction.user.id, detalhe)], components: [] });
     }
     } catch (error) {
         console.error('Erro ao processar interação:', error);
