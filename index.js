@@ -902,7 +902,8 @@ const comandoConfiguracoes = new SlashCommandBuilder()
     .addChannelOption(opt => opt.setName('categoria_canais').setDescription('Categoria').addChannelTypes(ChannelType.GuildCategory).setRequired(true))
     .addRoleOption(opt => opt.setName('cargo_evento').setDescription('Cargo permitido').setRequired(true))
     .addChannelOption(opt => opt.setName('categoria_registros').setDescription('Categoria onde os relatórios finais temporários serão guardados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
-    .addChannelOption(opt => opt.setName('canal_forum_builds').setDescription('Canal fórum das builds (Conteúdo - 01, Baú Dourado - 01...)').addChannelTypes(ChannelType.GuildForum).setRequired(false));
+    .addChannelOption(opt => opt.setName('canal_forum_builds').setDescription('Canal fórum das builds (Conteúdo - 01, Baú Dourado - 01...)').addChannelTypes(ChannelType.GuildForum).setRequired(false))
+    .addChannelOption(opt => opt.setName('categoria_leiloes').setDescription('Categoria onde os canais de leilão gerados pelo bot serão alocados').addChannelTypes(ChannelType.GuildCategory).setRequired(false));
 
 const comandoRanking = new SlashCommandBuilder()
     .setName('ranking')
