@@ -61,11 +61,7 @@ function carregarDados() {
             const dados = JSON.parse(fs.readFileSync(EVENTOS_PATH, 'utf8'));
             Object.entries(dados).forEach(([eventoId, evento]) => {
                 if (!evento?.id || !Array.isArray(evento.grupos)) return;
-                evento.grupos.forEach(grupo => {
-                    grupo.participantes = Array.isArray(grupo.participantes) ? grupo.participantes : [];
-                    grupo.participantes.forEach(p => { p.lastStartMs = null; });
-                    grupo.fechado = Boolean(grupo.fechado);
-                });
+                evento.grupos.forEach(grupo => normalizarGrupoPersistido(grupo));
                 eventosAtivos.set(eventoId, evento);
             });
         } catch (e) { console.error('Erro ao ler eventos-ativos.json', e); }
@@ -161,11 +157,7 @@ function recarregarEventoDoDisco(idEvento) {
         const dados = JSON.parse(fs.readFileSync(EVENTOS_PATH, 'utf8'));
         const evento = dados[idEvento];
         if (!evento?.id || !Array.isArray(evento.grupos)) return null;
-        evento.grupos.forEach(grupo => {
-            grupo.participantes = Array.isArray(grupo.participantes) ? grupo.participantes : [];
-            grupo.participantes.forEach(p => { if (p.lastStartMs) p.lastStartMs = null; });
-            grupo.fechado = Boolean(grupo.fechado);
-        });
+        evento.grupos.forEach(grupo => normalizarGrupoPersistido(grupo));
         eventosAtivos.set(idEvento, evento);
         return evento;
     } catch (e) {
@@ -275,6 +267,92 @@ function togglePause(participante) {
     }
 }
 
+function normalizarGrupoPersistido(grupo) {
+    grupo.participantes = Array.isArray(grupo.participantes) ? grupo.participantes : [];
+    grupo.participantes.forEach(p => { p.lastStartMs = null; });
+    grupo.fechado = Boolean(grupo.fechado);
+    grupo.conteudoEstado = grupo.conteudoEstado || 'aguardando';
+    grupo.conteudoTempoAcumuladoMs = grupo.conteudoTempoAcumuladoMs || 0;
+    if (grupo.conteudoEstado === 'rodando') {
+        if (grupo.conteudoRodandoDesdeMs) {
+            grupo.conteudoTempoAcumuladoMs += Math.max(0, Date.now() - grupo.conteudoRodandoDesdeMs);
+        }
+        grupo.conteudoEstado = 'pausado';
+        grupo.conteudoRodandoDesdeMs = null;
+    }
+}
+
+function tempoConteudoAtual(grupo) {
+    let ms = grupo.conteudoTempoAcumuladoMs || 0;
+    if (grupo.conteudoEstado === 'rodando' && grupo.conteudoRodandoDesdeMs) {
+        ms += Date.now() - grupo.conteudoRodandoDesdeMs;
+    }
+    return ms;
+}
+
+function obterStatusConteudoGrupo(grupo) {
+    const tempo = formatarDuracaoMs(tempoConteudoAtual(grupo));
+    if (grupo.conteudoEstado === 'rodando') return `▶️ Conteúdo em andamento — ${tempo}`;
+    if (grupo.conteudoEstado === 'pausado') return `⏸️ Conteúdo pausado — ${tempo}`;
+    return `⏳ Aguardando Play do líder — ${tempo}`;
+}
+
+function emojiStatusParticipante(grupo, participante) {
+    if (participante.isPaused) return '⏸️';
+    if (grupo.conteudoEstado !== 'rodando') return '⏳';
+    if (participante.lastStartMs) return '▶️';
+    return '🔇';
+}
+
+function pausarConteudoGrupo(grupo) {
+    if (grupo.conteudoEstado === 'rodando' && grupo.conteudoRodandoDesdeMs) {
+        grupo.conteudoTempoAcumuladoMs = (grupo.conteudoTempoAcumuladoMs || 0) + (Date.now() - grupo.conteudoRodandoDesdeMs);
+        grupo.conteudoRodandoDesdeMs = null;
+    }
+    grupo.conteudoEstado = 'pausado';
+    grupo.participantes.forEach(p => pararCronometroParticipante(p));
+}
+
+function retomarConteudoGrupo(guild, grupo) {
+    if (!grupo.conteudoInicioMs) grupo.conteudoInicioMs = Date.now();
+    grupo.conteudoEstado = 'rodando';
+    grupo.conteudoRodandoDesdeMs = Date.now();
+    sincronizarCronometrosGrupo(guild, grupo);
+}
+
+function iniciarConteudoGrupo(guild, grupo) {
+    if (!grupo.conteudoInicioMs) grupo.conteudoInicioMs = Date.now();
+    grupo.conteudoEstado = 'rodando';
+    grupo.conteudoRodandoDesdeMs = Date.now();
+    sincronizarCronometrosGrupo(guild, grupo);
+}
+
+function alternarConteudoGrupo(guild, grupo) {
+    if (grupo.conteudoEstado === 'rodando') {
+        pausarConteudoGrupo(grupo);
+        return 'pausado';
+    }
+    if (grupo.conteudoEstado === 'pausado') {
+        retomarConteudoGrupo(guild, grupo);
+        return 'rodando';
+    }
+    iniciarConteudoGrupo(guild, grupo);
+    return 'rodando';
+}
+
+function finalizarConteudoGrupo(grupo) {
+    pausarConteudoGrupo(grupo);
+}
+
+function sincronizarParticipanteSeElegivel(guild, grupo, participante) {
+    if (grupo.conteudoEstado !== 'rodando' || participante.isPaused) {
+        pararCronometroParticipante(participante);
+        return;
+    }
+    if (membroEstaNaSalaVoz(guild, grupo, participante.id)) iniciarCronometroParticipante(participante);
+    else pararCronometroParticipante(participante);
+}
+
 function deveAbrirSalaGrupo(grupo) {
     if (!grupo?.inicioPrevistoMs || grupo.canalVozId) return false;
     return Date.now() >= grupo.inicioPrevistoMs - (MINUTOS_ABERTURA_SALA * 60 * 1000);
@@ -282,11 +360,11 @@ function deveAbrirSalaGrupo(grupo) {
 
 function sincronizarCronometrosGrupo(guild, grupo) {
     if (!guild || !grupo?.canalVozId || grupo.fechado) return;
-    grupo.participantes.forEach(participante => {
-        if (participante.isPaused) return;
-        if (membroEstaNaSalaVoz(guild, grupo, participante.id)) iniciarCronometroParticipante(participante);
-        else pararCronometroParticipante(participante);
-    });
+    if (grupo.conteudoEstado !== 'rodando') {
+        grupo.participantes.forEach(p => pararCronometroParticipante(p));
+        return;
+    }
+    grupo.participantes.forEach(participante => sincronizarParticipanteSeElegivel(guild, grupo, participante));
 }
 
 // ==========================================
@@ -295,17 +373,16 @@ function sincronizarCronometrosGrupo(guild, grupo) {
 function gerarDashboardGrupo(evento, indexGrupo) {
     const idx = normalizarIndexGrupo(indexGrupo);
     const grupo = evento.grupos[idx];
-    const duracaoAtual = grupo.inicioAtivoMs ? Date.now() - grupo.inicioAtivoMs : 0;
     const lootFormatado = grupo.lootTotal.toLocaleString('pt-BR');
 
     const embed = new EmbedBuilder()
         .setTitle(`🛡️ GERENCIAMENTO DE GRUPO: BLOCO ${idx + 1}`)
-        .setColor('#2ecc71')
-        .setDescription(`**Horário Oficial:** ${grupo.horario}\n**Duração do Evento:** ⏱️ ${formatarDuracaoMs(duracaoAtual)}\n**Loot Total Acumulado:** 💰 \`${lootFormatado} Pratas\``);
+        .setColor(grupo.conteudoEstado === 'rodando' ? '#2ecc71' : '#95a5a6')
+        .setDescription(`**Horário Oficial:** ${grupo.horario}\n**Tempo de Conteúdo:** ⏱️ ${obterStatusConteudoGrupo(grupo)}\n**Loot Total Acumulado:** 💰 \`${lootFormatado} Pratas\`\n\n*O tempo só conta após o líder iniciar o conteúdo (Play).*`);
 
     let listagem = '';
     grupo.participantes.forEach(p => {
-        const statusEmoji = p.isPaused ? '⏸️' : (p.lastStartMs ? '▶️' : '🔇');
+        const statusEmoji = emojiStatusParticipante(grupo, p);
         const tempo = formatarDuracaoMs(tempoTotalAtual(p));
         listagem += `${statusEmoji} \`[${tempo}]\` <@${p.id}> — **${p.role}** [${p.arma}]\n`;
     });
@@ -332,23 +409,46 @@ function usuarioPodeGerenciarEvento(interaction, evento) {
 }
 
 function gerarPainelLiderGrupo(evento, indexGrupo) {
-    const grupo = evento.grupos[indexGrupo];
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
     if (!grupo || grupo.fechado) {
         return { content: '❌ Este grupo já foi fechado ou não está disponível.', components: [], ephemeral: true };
     }
 
-    const btnRowLider = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`dash_add_loot_${evento.id}_${indexGrupo}`).setLabel('Adicionar Valores (Split)').setEmoji('💰').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`dash_calc_split_${evento.id}_${indexGrupo}`).setLabel('Finalizar & Calcular Split').setEmoji('⚖️').setStyle(ButtonStyle.Secondary)
-    );
-
-    const componentes = [btnRowLider];
-    const opcoesMembros = grupo.participantes.map(p => ({ label: limitarTexto(`Alternar Pause: ${p.role} [${p.arma}]`), description: `Membro ID: ${p.id}`, value: p.id })).slice(0, MAX_OPCOES_MENU);
-    if (opcoesMembros.length > 0) {
-        componentes.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`dash_force_pause_${evento.id}_${indexGrupo}`).setPlaceholder('👑 Forçar pause/retomar de um membro...').addOptions(opcoesMembros)));
+    const estadoConteudo = grupo.conteudoEstado || 'aguardando';
+    let labelConteudo = 'Iniciar Conteúdo (Play)';
+    let emojiConteudo = '▶️';
+    let styleConteudo = ButtonStyle.Success;
+    if (estadoConteudo === 'rodando') {
+        labelConteudo = 'Pausar Conteúdo';
+        emojiConteudo = '⏸️';
+        styleConteudo = ButtonStyle.Danger;
+    } else if (estadoConteudo === 'pausado') {
+        labelConteudo = 'Retomar Conteúdo';
+        emojiConteudo = '▶️';
+        styleConteudo = ButtonStyle.Success;
     }
 
-    return { content: `👑 **Painel do Líder — Grupo ${parseInt(indexGrupo, 10) + 1}**`, components: componentes, ephemeral: true };
+    const btnRowConteudo = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`dash_conteudo_timer_${evento.id}_${idx}`).setLabel(labelConteudo).setEmoji(emojiConteudo).setStyle(styleConteudo)
+    );
+
+    const btnRowLider = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`dash_add_loot_${evento.id}_${idx}`).setLabel('Adicionar Valores (Split)').setEmoji('💰').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`dash_calc_split_${evento.id}_${idx}`).setLabel('Finalizar & Calcular Split').setEmoji('⚖️').setStyle(ButtonStyle.Secondary)
+    );
+
+    const componentes = [btnRowConteudo, btnRowLider];
+    const opcoesMembros = grupo.participantes.map(p => ({ label: limitarTexto(`Alternar Pause: ${p.role} [${p.arma}]`), description: `Membro ID: ${p.id}`, value: p.id })).slice(0, MAX_OPCOES_MENU);
+    if (opcoesMembros.length > 0) {
+        componentes.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`dash_force_pause_${evento.id}_${idx}`).setPlaceholder('👑 Forçar pause/retomar de um membro...').addOptions(opcoesMembros)));
+    }
+
+    return {
+        content: `👑 **Painel do Líder — Grupo ${idx + 1}**\n${obterStatusConteudoGrupo(grupo)}\n*Pausar o conteúdo pausa todos os cronômetros. Pause individual só afeta um membro.*`,
+        components: componentes,
+        ephemeral: true
+    };
 }
 
 async function atualizarMsgDashboard(guild, evento, indexGrupo) {
@@ -892,8 +992,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
                 const participante = grupo.participantes.find(p => p.id === userId);
                 if (!participante) continue;
 
-                if (saiuDaSala) pararCronometroParticipante(participante);
-                if (entrouNaSala) iniciarCronometroParticipante(participante);
+                if (saiuDaSala || entrouNaSala) sincronizarParticipanteSeElegivel(guild, grupo, participante);
 
                 await atualizarMsgDashboard(guild, evento, i);
                 salvarDados();
@@ -1009,7 +1108,11 @@ client.on('interactionCreate', async interaction => {
         for (let i = 0; i < numGrupos; i++) {
             const minParaInicio = minutosAteHorario(horariosRaw[i]); const inicioMs = minParaInicio !== null ? Date.now() + (minParaInicio * 60 * 1000) : null;
             if (inicioMs) iniciosPrevistosGrupos.push(inicioMs);
-            grupos.push({ horario: horariosRaw[i], participantes: [], notificado: false, canalVozId: null, canalTextoId: null, dashboardMsgId: null, inicioPrevistoMs: inicioMs, inicioAtivoMs: null, lootTotal: 0, fechado: false, fechadoEmMs: null });
+            grupos.push({
+                horario: horariosRaw[i], participantes: [], notificado: false, canalVozId: null, canalTextoId: null, dashboardMsgId: null,
+                inicioPrevistoMs: inicioMs, inicioAtivoMs: null, lootTotal: 0, fechado: false, fechadoEmMs: null,
+                conteudoEstado: 'aguardando', conteudoTempoAcumuladoMs: 0, conteudoRodandoDesdeMs: null, conteudoInicioMs: null
+            });
         }
 
         const novoEvento = {
@@ -1067,7 +1170,7 @@ client.on('interactionCreate', async interaction => {
         if (grupo.canalTextoId) {
             await interaction.guild.channels.cache.get(grupo.canalTextoId)?.permissionOverwrites.create(interaction.user.id, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
         }
-        if (membroEstaNaSalaVoz(interaction.guild, grupo, interaction.user.id)) iniciarCronometroParticipante(novoParticipante);
+        sincronizarParticipanteSeElegivel(interaction.guild, grupo, novoParticipante);
         if (grupo.canalTextoId) await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
         await atualizarMensagemPrincipalEvento(interaction.guild, evento);
         salvarDados();
@@ -1080,6 +1183,35 @@ client.on('interactionCreate', async interaction => {
         });
         const avisoDm = dmBuildEnviada ? '' : '\n⚠️ Não foi possível enviar a DM com o título da build (verifique se suas DMs estão abertas).';
         await interaction.update({ content: `✅ Registrado!${avisoDm}`, components: [] });
+    }
+
+    // BOTÃO: INICIAR / PAUSAR / RETOMAR CONTEÚDO (LÍDER)
+    if (interaction.isButton() && interaction.customId.startsWith('dash_conteudo_timer_')) {
+        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!usuarioPodeGerenciarEvento(interaction, evento)) {
+            return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode controlar o timer do conteúdo.', ephemeral: true });
+        }
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        if (!grupo || grupo.fechado) return interaction.reply({ content: '❌ Este grupo já foi fechado.', ephemeral: true });
+
+        const estadoAnterior = grupo.conteudoEstado || 'aguardando';
+        const novoEstado = alternarConteudoGrupo(interaction.guild, grupo);
+        salvarDados();
+        await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
+
+        let mensagem = '✅ Estado do conteúdo atualizado.';
+        if (novoEstado === 'rodando' && estadoAnterior === 'aguardando') {
+            mensagem = '▶️ **Conteúdo iniciado!** O tempo só conta para quem está na sala de voz.';
+        } else if (novoEstado === 'rodando') {
+            mensagem = '▶️ **Conteúdo retomado!** Cronômetros ativos na sala de voz.';
+        } else {
+            mensagem = '⏸️ **Conteúdo pausado.** Todos os cronômetros foram parados.';
+        }
+
+        const painel = gerarPainelLiderGrupo(evento, indexGrupo);
+        return interaction.reply({ content: mensagem, components: painel.components, ephemeral: true });
     }
 
     // BOTÃO: ABRIR PAINEL PRIVADO DO LÍDER
@@ -1100,8 +1232,10 @@ client.on('interactionCreate', async interaction => {
         const participante = grupo.participantes.find(p => p.id === interaction.user.id);
         if (!participante) return interaction.reply({ content: '❌ Não está ativo.', ephemeral: true });
         togglePause(participante);
-        if (!participante.isPaused && membroEstaNaSalaVoz(interaction.guild, grupo, interaction.user.id)) iniciarCronometroParticipante(participante);
-        const complemento = (!participante.isPaused && !participante.lastStartMs) ? '\nEntre na sala de voz para o tempo voltar a contar.' : '';
+        sincronizarParticipanteSeElegivel(interaction.guild, grupo, participante);
+        let complemento = '';
+        if (!participante.isPaused && grupo.conteudoEstado !== 'rodando') complemento = '\nO tempo só contará quando o líder iniciar o conteúdo (Play).';
+        else if (!participante.isPaused && !participante.lastStartMs) complemento = '\nEntre na sala de voz para o tempo voltar a contar.';
         await interaction.reply({ content: `✅ Seu cronômetro foi **${participante.isPaused ? 'Pausado' : 'Retomado'}**.${complemento}`, ephemeral: true });
         await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
         salvarDados();
@@ -1119,7 +1253,7 @@ client.on('interactionCreate', async interaction => {
         const participante = grupo.participantes.find(p => p.id === targetId);
         if (participante) {
             togglePause(participante);
-            if (!participante.isPaused && membroEstaNaSalaVoz(interaction.guild, grupo, targetId)) iniciarCronometroParticipante(participante);
+            sincronizarParticipanteSeElegivel(interaction.guild, grupo, participante);
             await interaction.reply({ content: `✅ Cronômetro de <@${targetId}> foi **${participante.isPaused ? 'Pausado' : 'Retomado'}**.`, ephemeral: true });
             await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
             salvarDados();
@@ -1168,14 +1302,20 @@ client.on('interactionCreate', async interaction => {
         if (!grupo) return interaction.reply({ content: '❌ Grupo não encontrado.', ephemeral: true });
         if (grupo.fechado) return interaction.reply({ content: '❌ Este split já foi fechado.', ephemeral: true });
 
+        finalizarConteudoGrupo(grupo);
         grupo.participantes.forEach(p => {
             pararCronometroParticipante(p);
             p.isPaused = true;
         });
         const totalMsGeral = grupo.participantes.reduce((acc, p) => acc + p.totalMs, 0);
-        if (totalMsGeral === 0) return interaction.reply({ content: '❌ Tempo zerado.', ephemeral: true });
+        if (totalMsGeral === 0) {
+            return interaction.reply({
+                content: '❌ Tempo zerado. O líder deve **Iniciar Conteúdo (Play)** no painel e os participantes precisam estar na sala de voz durante o conteúdo.',
+                ephemeral: true
+            });
+        }
 
-        const duracaoTotalTexto = formatarDuracaoMs(grupo.inicioAtivoMs ? Date.now() - grupo.inicioAtivoMs : 0);
+        const duracaoTotalTexto = formatarDuracaoMs(tempoConteudoAtual(grupo));
         await interaction.reply({ content: '⏳ Processando o fechamento da PT, adicionando XP e enviando os recibos na DM...', ephemeral: true });
         const falhasDmParticipantes = [];
 
