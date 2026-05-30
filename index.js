@@ -425,7 +425,9 @@ function normalizarSaldoMembro(saldo) {
         solicitadoEmMs: lancamento.solicitadoEmMs || null,
         pagoEmMs: lancamento.pagoEmMs || null,
         pagoPorId: lancamento.pagoPorId || null,
-        resgateId: lancamento.resgateId || null
+        resgateId: lancamento.resgateId || null,
+        editadoPorId: lancamento.editadoPorId || null,
+        transferenciaRefId: lancamento.transferenciaRefId || null
     })).filter(lancamento => lancamento.id);
 
     normalizado.resgates = normalizado.resgates.map(resgate => ({
@@ -528,6 +530,181 @@ function registrarSplitBauNoSaldo(evento, indexGrupo, resultado, origem) {
 
 function marcarSacolaPagaNoSaldo(evento, indexGrupo, userId, pagoPorId) {
     return marcarLancamentoSaldoPago(evento.guildId, userId, idLancamentoSacola(evento.id, indexGrupo, userId), pagoPorId);
+}
+
+async function usuarioPodeGerenciarSaldo(interaction, guildId) {
+    return usuarioPodeOperarLeilao(interaction, guildId);
+}
+
+function calcularTotalDisponivelSaldo(saldo) {
+    return saldo.lancamentos
+        .filter(item => item.status === 'disponivel' && item.valor > 0)
+        .reduce((acc, item) => acc + item.valor, 0);
+}
+
+function calcularTotalDebitoSaldo(saldo) {
+    return saldo.lancamentos
+        .filter(item => item.status === 'debito' && item.valor > 0)
+        .reduce((acc, item) => acc + item.valor, 0);
+}
+
+function idLancamentoManual(prefixo, guildId, userId) {
+    return `${prefixo}_${guildId}_${userId}_${Date.now()}`;
+}
+
+function registrarLancamentoManual(guildId, userId, lancamento, operadorId) {
+    if (!lancamento?.valor || lancamento.valor <= 0) return { ok: false, erro: 'Valor inválido.' };
+    const id = lancamento.id || idLancamentoManual(lancamento.tipo || 'ajuste', guildId, userId);
+    const criado = registrarLancamentoSaldo(guildId, userId, {
+        eventoId: null,
+        grupoIndex: null,
+        criadoEmMs: Date.now(),
+        editadoPorId: operadorId,
+        ...lancamento,
+        id,
+        status: lancamento.status || 'disponivel'
+    });
+    if (!criado) return { ok: false, erro: 'Não foi possível registrar o lançamento.' };
+    salvarDados();
+    return { ok: true, lancamento: criado };
+}
+
+function removerCreditoSaldo(guildId, userId, valor, operadorId, motivo = 'Ajuste manual') {
+    const valorRemover = Math.floor(Number(valor) || 0);
+    if (valorRemover <= 0) return { ok: false, erro: 'Informe um valor maior que zero.' };
+
+    const saldo = obterSaldoMembro(guildId, userId);
+    const disponiveis = saldo.lancamentos
+        .filter(item => item.status === 'disponivel' && item.valor > 0)
+        .sort((a, b) => (a.criadoEmMs || 0) - (b.criadoEmMs || 0));
+
+    const totalDisponivel = disponiveis.reduce((acc, item) => acc + item.valor, 0);
+    if (totalDisponivel < valorRemover) {
+        return { ok: false, erro: `Saldo disponível insuficiente. Disponível: ${formatarPrata(totalDisponivel)}.` };
+    }
+
+    let restante = valorRemover;
+    for (const lancamento of disponiveis) {
+        if (restante <= 0) break;
+        if (lancamento.valor <= restante) {
+            restante -= lancamento.valor;
+            lancamento.valor = 0;
+            lancamento.status = 'pago';
+            lancamento.pagoEmMs = Date.now();
+            lancamento.pagoPorId = operadorId;
+        } else {
+            lancamento.valor -= restante;
+            restante = 0;
+        }
+    }
+
+    saldo.lancamentos.push({
+        id: idLancamentoManual('remocao', guildId, userId),
+        guildId,
+        userId,
+        eventoId: null,
+        grupoIndex: null,
+        tipo: 'ajuste',
+        descricao: motivo,
+        valor: valorRemover,
+        status: 'pago',
+        criadoEmMs: Date.now(),
+        solicitadoEmMs: null,
+        pagoEmMs: Date.now(),
+        pagoPorId: operadorId,
+        resgateId: null,
+        editadoPorId: operadorId,
+        transferenciaRefId: null
+    });
+
+    salvarDados();
+    return { ok: true, valorRemovido: valorRemover, saldoRestante: calcularTotalDisponivelSaldo(saldo) };
+}
+
+function quitarDebitoSaldo(guildId, userId, valor, operadorId, motivo = 'Quitação de pendência') {
+    const valorQuitar = Math.floor(Number(valor) || 0);
+    if (valorQuitar <= 0) return { ok: false, erro: 'Informe um valor maior que zero.' };
+
+    const saldo = obterSaldoMembro(guildId, userId);
+    const debitos = saldo.lancamentos
+        .filter(item => item.status === 'debito' && item.valor > 0)
+        .sort((a, b) => (a.criadoEmMs || 0) - (b.criadoEmMs || 0));
+
+    const totalDebito = debitos.reduce((acc, item) => acc + item.valor, 0);
+    if (totalDebito < valorQuitar) {
+        return { ok: false, erro: `Débito pendente insuficiente. Pendente: ${formatarPrata(totalDebito)}.` };
+    }
+
+    let restante = valorQuitar;
+    for (const lancamento of debitos) {
+        if (restante <= 0) break;
+        if (lancamento.valor <= restante) {
+            restante -= lancamento.valor;
+            lancamento.valor = 0;
+            lancamento.status = 'pago';
+            lancamento.pagoEmMs = Date.now();
+            lancamento.pagoPorId = operadorId;
+        } else {
+            lancamento.valor -= restante;
+            restante = 0;
+        }
+    }
+
+    saldo.lancamentos.push({
+        id: idLancamentoManual('quitacao', guildId, userId),
+        guildId,
+        userId,
+        eventoId: null,
+        grupoIndex: null,
+        tipo: 'debito',
+        descricao: motivo,
+        valor: valorQuitar,
+        status: 'pago',
+        criadoEmMs: Date.now(),
+        solicitadoEmMs: null,
+        pagoEmMs: Date.now(),
+        pagoPorId: operadorId,
+        resgateId: null,
+        editadoPorId: operadorId,
+        transferenciaRefId: null
+    });
+
+    salvarDados();
+    return { ok: true, valorQuitado: valorQuitar, debitoRestante: calcularTotalDebitoSaldo(saldo) };
+}
+
+function transferirSaldoEntreMembros(guildId, origemId, destinoId, valor, operadorId, motivo = 'Transferência manual') {
+    if (origemId === destinoId) return { ok: false, erro: 'Origem e destino devem ser membros diferentes.' };
+
+    const valorTransferir = Math.floor(Number(valor) || 0);
+    if (valorTransferir <= 0) return { ok: false, erro: 'Informe um valor maior que zero.' };
+
+    const refId = `transfer_${Date.now()}`;
+    const remocao = removerCreditoSaldo(guildId, origemId, valorTransferir, operadorId, `${motivo} → <@${destinoId}>`);
+    if (!remocao.ok) return remocao;
+
+    const credito = registrarLancamentoManual(guildId, destinoId, {
+        tipo: 'transferencia',
+        descricao: `${motivo} ← <@${origemId}>`,
+        valor: valorTransferir,
+        status: 'disponivel',
+        transferenciaRefId: refId
+    }, operadorId);
+
+    if (!credito.ok) {
+        registrarLancamentoManual(guildId, origemId, {
+            tipo: 'ajuste',
+            descricao: `Estorno automático — falha na transferência para <@${destinoId}>`,
+            valor: valorTransferir,
+            status: 'disponivel',
+            transferenciaRefId: refId
+        }, operadorId);
+        return { ok: false, erro: 'Falha ao creditar o destino. O valor foi estornado à origem.' };
+    }
+
+    credito.lancamento.transferenciaRefId = refId;
+    salvarDados();
+    return { ok: true, valorTransferido: valorTransferir, refId };
 }
 
 function obterSacolaTotal(grupo) {
@@ -1442,38 +1619,57 @@ function obterLeiloesAtivosUsuario(guildId, userId) {
 
 function linhasLancamentosSaldo(lancamentos, limite = 8) {
     const lista = lancamentos.slice(-limite).reverse();
-    return lista.map(item => `• **${formatarPrata(item.valor)}** — ${item.descricao}`);
+    return lista.map(item => {
+        const icone = item.status === 'debito' ? '🔴' : '•';
+        return `${icone} **${formatarPrata(item.valor)}** — ${item.descricao}`;
+    });
 }
 
-function gerarEmbedSaldo(guildId, userId) {
+function gerarEmbedSaldo(guildId, userId, opcoes = {}) {
     const saldo = obterSaldoMembro(guildId, userId);
     const disponiveis = saldo.lancamentos.filter(item => item.status === 'disponivel' && item.valor > 0);
     const solicitados = saldo.lancamentos.filter(item => item.status === 'solicitado' && item.valor > 0);
     const pagos = saldo.lancamentos.filter(item => item.status === 'pago' && item.valor > 0);
+    const debitos = saldo.lancamentos.filter(item => item.status === 'debito' && item.valor > 0);
     const leiloes = obterLeiloesAtivosUsuario(guildId, userId);
-    const totalDisponivel = disponiveis.reduce((acc, item) => acc + item.valor, 0);
+    const totalDisponivel = calcularTotalDisponivelSaldo(saldo);
     const totalSolicitado = solicitados.reduce((acc, item) => acc + item.valor, 0);
+    const totalDebito = calcularTotalDebitoSaldo(saldo);
+    const saldoLiquido = totalDisponivel - totalDebito;
+    const tituloMembro = opcoes.consultaAdmin ? `💼 Saldo de <@${userId}>` : '💼 Seu saldo de splits';
 
     const embed = new EmbedBuilder()
-        .setTitle('💼 Seu saldo de splits')
-        .setColor(totalDisponivel > 0 ? '#2ecc71' : '#95a5a6')
-        .setDescription(`Saldo disponível para resgate: **${formatarPrata(totalDisponivel)}**\nResgates aguardando pagamento: **${formatarPrata(totalSolicitado)}**`);
+        .setTitle(tituloMembro)
+        .setColor(saldoLiquido > 0 ? '#2ecc71' : totalDebito > 0 ? '#e74c3c' : '#95a5a6')
+        .setDescription(
+            `Saldo disponível para resgate: **${formatarPrata(totalDisponivel)}**\n` +
+            `Débitos pendentes: **${formatarPrata(totalDebito)}**\n` +
+            `Saldo líquido: **${formatarPrata(Math.max(0, saldoLiquido))}**${totalDebito > totalDisponivel ? ' *(negativo)*' : ''}\n` +
+            `Resgates aguardando pagamento: **${formatarPrata(totalSolicitado)}**`
+        );
 
     adicionarCampoLongo(embed, 'Disponível para resgate', linhasLancamentosSaldo(disponiveis).join('\n') || 'Nada disponível no momento.');
+    adicionarCampoLongo(embed, 'Débitos / pendências', linhasLancamentosSaldo(debitos).join('\n') || 'Nenhum débito registrado.');
     adicionarCampoLongo(embed, 'Pendente de pagamento', linhasLancamentosSaldo(solicitados).join('\n') || 'Nenhum resgate solicitado.');
     adicionarCampoLongo(embed, 'Em leilão', leiloes.map(item => `• ${item.eventoNome} | Grupo ${item.grupo} | ${item.localLoot} | ${item.channelId ? `<#${item.channelId}>` : 'canal não localizado'} | referência: **${formatarPrata(item.lanceAtual)}**`).join('\n') || 'Nenhum baú seu está em leilão agora.');
     adicionarCampoLongo(embed, 'Últimos pagos', linhasLancamentosSaldo(pagos, 5).join('\n') || 'Nenhum pagamento registrado.');
     return embed;
 }
 
-function gerarComponentesSaldo(guildId, userId) {
+function gerarComponentesSaldo(guildId, userId, viewerId = null) {
     const saldo = obterSaldoMembro(guildId, userId);
-    const totalDisponivel = saldo.lancamentos
-        .filter(item => item.status === 'disponivel' && item.valor > 0)
-        .reduce((acc, item) => acc + item.valor, 0);
-    return totalDisponivel > 0
-        ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`saldo_resgate_${guildId}_${userId}`).setLabel('Solicitar Resgate').setEmoji('💸').setStyle(ButtonStyle.Success))]
-        : [];
+    const totalDisponivel = calcularTotalDisponivelSaldo(saldo);
+    const totalDebito = calcularTotalDebitoSaldo(saldo);
+    const podeResgatar = totalDisponivel > 0 && totalDebito === 0;
+    const ehDono = !viewerId || viewerId === userId;
+    const componentes = [];
+
+    if (ehDono && podeResgatar) {
+        componentes.push(new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`saldo_resgate_${guildId}_${userId}`).setLabel('Solicitar Resgate').setEmoji('💸').setStyle(ButtonStyle.Success)
+        ));
+    }
+    return componentes;
 }
 
 async function enviarDmResponsaveisLeilao(guild, configGuild, payload) {
@@ -1556,6 +1752,14 @@ async function solicitarResgateSaldo(interaction, guildId, userId) {
     }
 
     const saldo = obterSaldoMembro(guildId, userId);
+    const totalDebito = calcularTotalDebitoSaldo(saldo);
+    if (totalDebito > 0) {
+        return interaction.reply({
+            content: `❌ Você possui débitos pendentes de **${formatarPrata(totalDebito)}**. Regularize com a tesouraria antes de solicitar resgate.`,
+            ephemeral: true
+        });
+    }
+
     const disponiveis = saldo.lancamentos.filter(item => item.status === 'disponivel' && item.valor > 0);
     if (disponiveis.length === 0) {
         return interaction.update({ embeds: [gerarEmbedSaldo(guildId, userId)], components: gerarComponentesSaldo(guildId, userId) });
@@ -1651,6 +1855,152 @@ async function marcarResgateComoPago(interaction, guildId, userId, resgateId) {
     await enviarDmUsuario(userId, { embeds: [new EmbedBuilder().setTitle('✅ Resgate pago').setColor('#2ecc71').setDescription(`Seu resgate de **${formatarPrata(resgate.valorTotal)}** foi marcado como pago por <@${interaction.user.id}>.`)] });
     const resposta = { content: `✅ Resgate de <@${userId}> marcado como pago: **${formatarPrata(resgate.valorTotal)}**.`, components: [] };
     return interaction.editReply(resposta);
+}
+
+async function processarComandoSaldoGerenciar(interaction) {
+    const guildId = interaction.guild.id;
+    const podeGerenciar = await usuarioPodeGerenciarSaldo(interaction, guildId);
+    if (!podeGerenciar) {
+        return interaction.reply({
+            content: '❌ Apenas administradores ou o cargo responsável por leilões/resgates (configurado em /configuracoes) pode gerenciar saldos.',
+            ephemeral: true
+        });
+    }
+
+    const subcomando = interaction.options.getSubcommand();
+    const motivoPadrao = (texto, fallback) => limitarTexto(texto || fallback, 120);
+
+    if (subcomando === 'consultar') {
+        const membro = interaction.options.getUser('membro');
+        return interaction.reply({
+            embeds: [gerarEmbedSaldo(guildId, membro.id, { consultaAdmin: true })],
+            components: gerarComponentesSaldo(guildId, membro.id, interaction.user.id),
+            ephemeral: true
+        });
+    }
+
+    const valor = interaction.options.getInteger('valor');
+    const operadorId = interaction.user.id;
+
+    if (subcomando === 'adicionar') {
+        const membro = interaction.options.getUser('membro');
+        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Crédito manual por <@${operadorId}>`);
+        const resultado = registrarLancamentoManual(guildId, membro.id, {
+            tipo: 'ajuste',
+            descricao: motivo,
+            valor,
+            status: 'disponivel'
+        }, operadorId);
+
+        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
+
+        await enviarDmUsuario(membro.id, {
+            embeds: [new EmbedBuilder()
+                .setTitle('💰 Crédito adicionado ao seu saldo')
+                .setColor('#2ecc71')
+                .setDescription(`**${formatarPrata(valor)}** foram adicionados ao seu saldo.\n**Motivo:** ${motivo}\n**Por:** <@${operadorId}>`)]
+        });
+
+        const saldoAtual = calcularTotalDisponivelSaldo(obterSaldoMembro(guildId, membro.id));
+        return interaction.reply({
+            content: `✅ **${formatarPrata(valor)}** adicionados ao saldo de <@${membro.id}>.\nSaldo disponível atual: **${formatarPrata(saldoAtual)}**.`,
+            ephemeral: true
+        });
+    }
+
+    if (subcomando === 'remover') {
+        const membro = interaction.options.getUser('membro');
+        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Remoção manual por <@${operadorId}>`);
+        const resultado = removerCreditoSaldo(guildId, membro.id, valor, operadorId, motivo);
+        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
+
+        await enviarDmUsuario(membro.id, {
+            embeds: [new EmbedBuilder()
+                .setTitle('📉 Crédito removido do seu saldo')
+                .setColor('#e67e22')
+                .setDescription(`**${formatarPrata(valor)}** foram removidos do seu saldo.\n**Motivo:** ${motivo}\n**Por:** <@${operadorId}>`)]
+        });
+
+        return interaction.reply({
+            content: `✅ **${formatarPrata(valor)}** removidos do saldo de <@${membro.id}>.\nSaldo disponível restante: **${formatarPrata(resultado.saldoRestante)}**.`,
+            ephemeral: true
+        });
+    }
+
+    if (subcomando === 'transferir') {
+        const origem = interaction.options.getUser('origem');
+        const destino = interaction.options.getUser('destino');
+        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Transferência por <@${operadorId}>`);
+        const resultado = transferirSaldoEntreMembros(guildId, origem.id, destino.id, valor, operadorId, motivo);
+        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
+
+        const saldoOrigem = calcularTotalDisponivelSaldo(obterSaldoMembro(guildId, origem.id));
+        const saldoDestino = calcularTotalDisponivelSaldo(obterSaldoMembro(guildId, destino.id));
+
+        await enviarDmUsuario(origem.id, {
+            embeds: [new EmbedBuilder()
+                .setTitle('🔁 Transferência enviada')
+                .setColor('#3498db')
+                .setDescription(`Você transferiu **${formatarPrata(valor)}** para <@${destino.id}>.\n**Motivo:** ${motivo}\n**Saldo restante:** ${formatarPrata(saldoOrigem)}`)]
+        });
+        await enviarDmUsuario(destino.id, {
+            embeds: [new EmbedBuilder()
+                .setTitle('🔁 Transferência recebida')
+                .setColor('#2ecc71')
+                .setDescription(`Você recebeu **${formatarPrata(valor)}** de <@${origem.id}>.\n**Motivo:** ${motivo}\n**Saldo disponível:** ${formatarPrata(saldoDestino)}`)]
+        });
+
+        return interaction.reply({
+            content: `✅ **${formatarPrata(valor)}** transferidos de <@${origem.id}> para <@${destino.id}>.\nOrigem: **${formatarPrata(saldoOrigem)}** | Destino: **${formatarPrata(saldoDestino)}**.`,
+            ephemeral: true
+        });
+    }
+
+    if (subcomando === 'pendencia') {
+        const membro = interaction.options.getUser('membro');
+        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Pendência registrada por <@${operadorId}>`);
+        const resultado = registrarLancamentoManual(guildId, membro.id, {
+            tipo: 'debito',
+            descricao: motivo,
+            valor,
+            status: 'debito'
+        }, operadorId);
+        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
+
+        const debitoTotal = calcularTotalDebitoSaldo(obterSaldoMembro(guildId, membro.id));
+        await enviarDmUsuario(membro.id, {
+            embeds: [new EmbedBuilder()
+                .setTitle('🔴 Pendência registrada')
+                .setColor('#e74c3c')
+                .setDescription(`Foi registrado um débito de **${formatarPrata(valor)}** em seu saldo.\n**Motivo:** ${motivo}\n**Total de débitos:** ${formatarPrata(debitoTotal)}`)]
+        });
+
+        return interaction.reply({
+            content: `✅ Débito de **${formatarPrata(valor)}** registrado para <@${membro.id}>.\nTotal de pendências: **${formatarPrata(debitoTotal)}**.`,
+            ephemeral: true
+        });
+    }
+
+    if (subcomando === 'quitar-pendencia') {
+        const membro = interaction.options.getUser('membro');
+        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Quitação de pendência por <@${operadorId}>`);
+        const resultado = quitarDebitoSaldo(guildId, membro.id, valor, operadorId, motivo);
+        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
+
+        await enviarDmUsuario(membro.id, {
+            embeds: [new EmbedBuilder()
+                .setTitle('✅ Pendência quitada')
+                .setColor('#2ecc71')
+                .setDescription(`**${formatarPrata(valor)}** de débito foram quitados.\n**Motivo:** ${motivo}\n**Débito restante:** ${formatarPrata(resultado.debitoRestante)}`)]
+        });
+
+        return interaction.reply({
+            content: `✅ **${formatarPrata(valor)}** de pendência quitados para <@${membro.id}>.\nDébito restante: **${formatarPrata(resultado.debitoRestante)}**.`,
+            ephemeral: true
+        });
+    }
+
+    return interaction.reply({ content: '❌ Subcomando não reconhecido.', ephemeral: true });
 }
 
 function gerarMenuRoles(idEvento, indexGrupo) {
@@ -1953,7 +2303,7 @@ const comandoConfiguracoes = new SlashCommandBuilder()
     .addRoleOption(opt => opt.setName('cargo_evento').setDescription('Cargo permitido').setRequired(true))
     .addChannelOption(opt => opt.setName('categoria_registros').setDescription('Categoria onde os relatórios finais temporários serão guardados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
     .addChannelOption(opt => opt.setName('categoria_leiloes').setDescription('Categoria onde os canais temporários de leilão serão criados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
-    .addRoleOption(opt => opt.setName('cargo_leiloes').setDescription('Cargo responsável por vendas, leilões e resgates').setRequired(false))
+    .addRoleOption(opt => opt.setName('cargo_leiloes').setDescription('Cargo responsável por vendas, leilões, resgates e gestão de saldos').setRequired(false))
     .addChannelOption(opt => opt.setName('canal_forum_builds').setDescription('Canal fórum das builds (Conteúdo - 01, Baú Dourado - 01...)').addChannelTypes(ChannelType.GuildForum).setRequired(false));
 
 const comandoRanking = new SlashCommandBuilder()
@@ -1962,13 +2312,54 @@ const comandoRanking = new SlashCommandBuilder()
 
 const comandoSaldo = new SlashCommandBuilder()
     .setName('saldo')
-    .setDescription('Consulta seus splits, leilões pendentes e saldo disponível para resgate');
+    .setDescription('Consulta splits, leilões pendentes e saldo disponível para resgate')
+    .addUserOption(opt => opt.setName('membro').setDescription('Consultar saldo de outro membro (cargo responsável)').setRequired(false));
+
+const comandoSaldoGerenciar = new SlashCommandBuilder()
+    .setName('saldo-gerenciar')
+    .setDescription('Gerencia saldos de membros (cargo de leilões/resgates ou admin)')
+    .addSubcommand(sub => sub
+        .setName('adicionar')
+        .setDescription('Adiciona crédito ao saldo de um membro')
+        .addUserOption(opt => opt.setName('membro').setDescription('Membro que receberá o crédito').setRequired(true))
+        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
+        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo do ajuste').setRequired(false)))
+    .addSubcommand(sub => sub
+        .setName('remover')
+        .setDescription('Remove crédito disponível do saldo de um membro')
+        .addUserOption(opt => opt.setName('membro').setDescription('Membro que terá o crédito removido').setRequired(true))
+        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
+        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo do ajuste').setRequired(false)))
+    .addSubcommand(sub => sub
+        .setName('transferir')
+        .setDescription('Transfere crédito disponível entre dois membros')
+        .addUserOption(opt => opt.setName('origem').setDescription('Membro de origem').setRequired(true))
+        .addUserOption(opt => opt.setName('destino').setDescription('Membro de destino').setRequired(true))
+        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
+        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo da transferência').setRequired(false)))
+    .addSubcommand(sub => sub
+        .setName('pendencia')
+        .setDescription('Registra um débito/pendência para um membro')
+        .addUserOption(opt => opt.setName('membro').setDescription('Membro que receberá o débito').setRequired(true))
+        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
+        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo da pendência').setRequired(false)))
+    .addSubcommand(sub => sub
+        .setName('quitar-pendencia')
+        .setDescription('Quita parte ou total de débitos pendentes de um membro')
+        .addUserOption(opt => opt.setName('membro').setDescription('Membro que terá o débito quitado').setRequired(true))
+        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
+        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo da quitação').setRequired(false)))
+    .addSubcommand(sub => sub
+        .setName('consultar')
+        .setDescription('Consulta o saldo detalhado de um membro')
+        .addUserOption(opt => opt.setName('membro').setDescription('Membro a consultar').setRequired(true)));
 
 const COMANDOS_SLASH_JSON = [
     comandoEvento.toJSON(),
     comandoConfiguracoes.toJSON(),
     comandoRanking.toJSON(),
-    comandoSaldo.toJSON()
+    comandoSaldo.toJSON(),
+    comandoSaldoGerenciar.toJSON()
 ];
 
 async function registrarComandosSlash(rest, guildIds = []) {
@@ -2105,12 +2496,34 @@ client.on('interactionCreate', async interaction => {
     // COMANDO /SALDO
     if (interaction.isChatInputCommand() && interaction.commandName === 'saldo') {
         const guildId = interaction.guild.id;
-        const userId = interaction.user.id;
+        const membroAlvo = interaction.options.getUser('membro');
+        const userId = membroAlvo?.id || interaction.user.id;
+
+        if (membroAlvo && membroAlvo.id !== interaction.user.id) {
+            const podeConsultar = await usuarioPodeGerenciarSaldo(interaction, guildId);
+            if (!podeConsultar) {
+                return interaction.reply({
+                    content: '❌ Apenas administradores ou o cargo responsável por leilões/resgates pode consultar o saldo de outros membros.',
+                    ephemeral: true
+                });
+            }
+            return interaction.reply({
+                embeds: [gerarEmbedSaldo(guildId, userId, { consultaAdmin: true })],
+                components: gerarComponentesSaldo(guildId, userId, interaction.user.id),
+                ephemeral: true
+            });
+        }
+
         return interaction.reply({
             embeds: [gerarEmbedSaldo(guildId, userId)],
-            components: gerarComponentesSaldo(guildId, userId),
+            components: gerarComponentesSaldo(guildId, userId, interaction.user.id),
             ephemeral: true
         });
+    }
+
+    // COMANDO /SALDO-GERENCIAR
+    if (interaction.isChatInputCommand() && interaction.commandName === 'saldo-gerenciar') {
+        return processarComandoSaldoGerenciar(interaction);
     }
 
     // COMANDO /CONFIGURACOES
