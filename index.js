@@ -27,6 +27,10 @@ const RECIBO_TAXA_GUILDA_MARCADOR = 'FLG_GUILD_TAX';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID || null;
+const CANAL_RECIBOS_INTEGRACAO_ID = process.env.CANAL_RECIBOS_INTEGRACAO_ID || null;
+const CANAL_RECIBOS_ID = process.env.CANAL_RECIBOS_ID || null;
+const CATEGORIA_REGISTROS_ID = process.env.CATEGORIA_REGISTROS_ID || null;
+const CANAL_TAXAS_GUILDA_ID = process.env.CANAL_TAXAS_GUILDA_ID || null;
 const TIME_ZONE = process.env.TIME_ZONE || 'America/Sao_Paulo';
 const MINUTOS_ABERTURA_SALA = 30;
 const MAX_OPCOES_MENU = 25;
@@ -53,7 +57,8 @@ function carregarDados() {
         try {
             const dados = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
             Object.entries(dados).forEach(([guildId, config]) => {
-                if (config?.categoriaId && config?.cargoEventoId) configuracoesPorGuild.set(guildId, config);
+                if (!config || typeof config !== 'object') return;
+                if (config.categoriaId && config.cargoEventoId) configuracoesPorGuild.set(guildId, config);
             });
         } catch (e) { console.error('Erro ao ler guild-config.json', e); }
     }
@@ -109,6 +114,49 @@ function salvarDados() {
     } catch (e) { console.error('Erro ao salvar arquivos de banco de dados locais', e); }
 }
 carregarDados();
+
+function recarregarConfigGuildDoDisco(guildId) {
+    if (!guildId || !fs.existsSync(CONFIG_PATH)) return null;
+    try {
+        const dados = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        const config = dados[guildId];
+        if (!config?.categoriaId || !config?.cargoEventoId) return null;
+        configuracoesPorGuild.set(guildId, config);
+        return config;
+    } catch (e) {
+        console.error('Erro ao recarregar guild-config.json:', e);
+        return null;
+    }
+}
+
+function obterConfigGuild(guildId) {
+    if (!guildId) return null;
+    const config = configuracoesPorGuild.get(guildId) || recarregarConfigGuildDoDisco(guildId);
+    if (!config) return null;
+    return {
+        ...config,
+        canalRecibosId: config.canalRecibosId || CANAL_RECIBOS_ID || null,
+        canalRecibosIntegracaoId: config.canalRecibosIntegracaoId || CANAL_RECIBOS_INTEGRACAO_ID || null,
+        categoriaRegistrosId: config.categoriaRegistrosId || CATEGORIA_REGISTROS_ID || null,
+        canalTaxasGuildaId: config.canalTaxasGuildaId || CANAL_TAXAS_GUILDA_ID || null
+    };
+}
+
+function textoMotivoPublicacao(resultado, rotulo) {
+    if (resultado?.publicado || resultado?.criado) {
+        return `**${rotulo}:** enviado em <#${resultado.channelId || resultado.canalId}>`;
+    }
+    const motivos = {
+        canal_nao_configurado: 'canal não configurado — use `/configuracoes`',
+        categoria_nao_configurada: 'categoria de registros não configurada',
+        categoria_invalida: 'categoria de registros inválida',
+        canal_invalido: 'canal inválido ou sem permissão de envio',
+        falha_ao_enviar: 'falha ao enviar (verifique permissões do bot)',
+        erro_ao_criar: 'erro ao criar canal de registro'
+    };
+    const motivo = motivos[resultado?.motivo] || resultado?.motivo || 'não enviado';
+    return `**${rotulo}:** ${motivo}`;
+}
 
 // ==========================================
 // FUNÇÕES AUXILIARES DE CÁLCULO E TEMPO
@@ -551,24 +599,66 @@ function montarPayloadReciboIntegracao(evento, indexGrupo, tipoEvento) {
 }
 
 async function publicarReciboCanalIntegracao(guild, configGuild, evento, indexGrupo, tipoEvento) {
-    const channelId = configGuild?.canalRecibosIntegracaoId;
-    if (!guild || !channelId) return { publicado: false, motivo: 'canal_nao_configurado' };
+    const config = configGuild || obterConfigGuild(guild?.id);
+    const channelId = config?.canalRecibosIntegracaoId;
+    if (!guild || !channelId) {
+        console.warn(`[recibo-json] Não publicado (${tipoEvento}): canalRecibosIntegracaoId ausente para guild ${guild?.id}`);
+        return { publicado: false, motivo: 'canal_nao_configurado' };
+    }
 
     const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
-    if (!canal?.isTextBased?.()) return { publicado: false, motivo: 'canal_invalido' };
+    if (!canal?.isTextBased?.()) {
+        console.warn(`[recibo-json] Canal inválido ${channelId} (${tipoEvento})`);
+        return { publicado: false, motivo: 'canal_invalido' };
+    }
 
     const idx = normalizarIndexGrupo(indexGrupo);
     const payload = montarPayloadReciboIntegracao(evento, idx, tipoEvento);
-    const json = JSON.stringify(payload);
+    const json = JSON.stringify(payload, null, 2);
     const nomeArquivo = `flg-recibo-${evento.id}-g${idx + 1}-${tipoEvento}.json`;
 
     const mensagem = await canal.send({
         content: `${RECIBO_INTEGRACAO_MARCADOR} ${RECIBO_INTEGRACAO_SCHEMA} | ${tipoEvento} | evento:${evento.id} | grupo:${idx + 1}`,
         files: [{ attachment: Buffer.from(json, 'utf8'), name: nomeArquivo }]
     }).catch(error => {
-        console.error('Erro ao publicar recibo de integração:', error);
+        console.error(`[recibo-json] Erro ao publicar (${tipoEvento}):`, error);
         return null;
     });
+
+    if (mensagem) {
+        console.log(`[recibo-json] Publicado ${tipoEvento} evento ${evento.id} grupo ${idx + 1} em #${canal.name}`);
+    }
+
+    return mensagem
+        ? { publicado: true, channelId: canal.id, messageId: mensagem.id }
+        : { publicado: false, motivo: 'falha_ao_enviar' };
+}
+
+async function publicarReciboCanalVisual(guild, configGuild, evento, indexGrupo, embedSplit, tipoEvento = 'split_sacolas') {
+    const config = configGuild || obterConfigGuild(guild?.id);
+    const channelId = config?.canalRecibosId;
+    if (!guild || !channelId) {
+        return { publicado: false, motivo: 'canal_nao_configurado' };
+    }
+
+    const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (!canal?.isTextBased?.()) {
+        console.warn(`[recibo-visual] Canal inválido ${channelId}`);
+        return { publicado: false, motivo: 'canal_invalido' };
+    }
+
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const mensagem = await canal.send({
+        content: `🧾 **Recibo** — ${evento.nome} · Grupo ${idx + 1} · \`${tipoEvento}\``,
+        embeds: [embedSplit]
+    }).catch(error => {
+        console.error('[recibo-visual] Erro ao publicar:', error);
+        return null;
+    });
+
+    if (mensagem) {
+        console.log(`[recibo-visual] Publicado ${tipoEvento} evento ${evento.id} grupo ${idx + 1} em #${canal.name}`);
+    }
 
     return mensagem
         ? { publicado: true, channelId: canal.id, messageId: mensagem.id }
@@ -600,24 +690,37 @@ function montarPayloadReciboTaxaGuilda(evento, indexGrupo, source, dadosTaxa) {
 }
 
 async function publicarReciboTaxaGuilda(guild, configGuild, evento, indexGrupo, source, dadosTaxa) {
-    const channelId = configGuild?.canalTaxasGuildaId;
-    if (!guild || !channelId || !dadosTaxa?.amount) return { publicado: false, motivo: 'canal_nao_configurado' };
+    const config = configGuild || obterConfigGuild(guild?.id);
+    const channelId = config?.canalTaxasGuildaId;
+    if (!guild || !channelId || !dadosTaxa?.amount) {
+        if (dadosTaxa?.amount > 0) {
+            console.warn(`[taxa-guilda] Não publicada (${source}): canalTaxasGuildaId ausente para guild ${guild?.id}`);
+        }
+        return { publicado: false, motivo: 'canal_nao_configurado' };
+    }
 
     const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
-    if (!canal?.isTextBased?.()) return { publicado: false, motivo: 'canal_invalido' };
+    if (!canal?.isTextBased?.()) {
+        console.warn(`[taxa-guilda] Canal inválido ${channelId} (${source})`);
+        return { publicado: false, motivo: 'canal_invalido' };
+    }
 
     const idx = normalizarIndexGrupo(indexGrupo);
     const payload = montarPayloadReciboTaxaGuilda(evento, idx, source, dadosTaxa);
-    const json = JSON.stringify(payload);
+    const json = JSON.stringify(payload, null, 2);
     const nomeArquivo = `flg-taxa-guilda-${evento.id}-g${idx + 1}-${source}.json`;
 
     const mensagem = await canal.send({
         content: `${RECIBO_TAXA_GUILDA_MARCADOR} ${RECIBO_TAXA_GUILDA_SCHEMA} | ${source} | +${formatarPrata(dadosTaxa.amount)} | acumulado:${formatarPrata(dadosTaxa.cumulativeTotal)} | evento:${evento.id} | grupo:${idx + 1}`,
         files: [{ attachment: Buffer.from(json, 'utf8'), name: nomeArquivo }]
     }).catch(error => {
-        console.error('Erro ao publicar recibo de taxa da guilda:', error);
+        console.error(`[taxa-guilda] Erro ao publicar (${source}):`, error);
         return null;
     });
+
+    if (mensagem) {
+        console.log(`[taxa-guilda] Publicada ${source} +${dadosTaxa.amount} (acumulado ${dadosTaxa.cumulativeTotal}) em #${canal.name}`);
+    }
 
     return mensagem
         ? { publicado: true, channelId: canal.id, messageId: mensagem.id }
@@ -626,7 +729,7 @@ async function publicarReciboTaxaGuilda(guild, configGuild, evento, indexGrupo, 
 
 async function registrarEPublicarTaxaGuilda(guild, configGuild, evento, indexGrupo, source, baseValue, taxPercent) {
     const amount = calcularTaxaGuilda(baseValue, taxPercent);
-    if (amount <= 0) return { registrado: false, amount: 0 };
+    if (amount <= 0) return { registrado: false, amount: 0, acumuladoLocal: false, publicadoCanal: false };
 
     const cumulativeTotal = registrarTaxaGuildaAcumulada(evento.guildId, amount);
     const publicacao = await publicarReciboTaxaGuilda(guild, configGuild, evento, indexGrupo, source, {
@@ -636,7 +739,14 @@ async function registrarEPublicarTaxaGuilda(guild, configGuild, evento, indexGru
         cumulativeTotal
     });
 
-    return { registrado: publicacao.publicado, amount, cumulativeTotal, ...publicacao };
+    return {
+        registrado: true,
+        acumuladoLocal: true,
+        publicadoCanal: publicacao.publicado,
+        amount,
+        cumulativeTotal,
+        ...publicacao
+    };
 }
 
 function obterSacolaTotal(grupo) {
@@ -1824,9 +1934,10 @@ async function estenderRetencaoRegistroLeilao(guild, grupo) {
 }
 
 async function criarCanalRegistroSplit(guild, evento, indexGrupo, embedSplit, configGuild) {
-    if (!configGuild?.categoriaRegistrosId) return { criado: false, motivo: 'categoria_nao_configurada' };
+    const config = configGuild || obterConfigGuild(guild?.id);
+    if (!config?.categoriaRegistrosId) return { criado: false, motivo: 'categoria_nao_configurada' };
 
-    const categoria = guild.channels.cache.get(configGuild.categoriaRegistrosId) || await guild.channels.fetch(configGuild.categoriaRegistrosId).catch(() => null);
+    const categoria = guild.channels.cache.get(config.categoriaRegistrosId) || await guild.channels.fetch(config.categoriaRegistrosId).catch(() => null);
     if (!categoria || categoria.type !== ChannelType.GuildCategory) return { criado: false, motivo: 'categoria_invalida' };
 
     const apagarEmMs = Date.now() + TEMPO_RETENCAO_REGISTROS_MS;
@@ -1934,6 +2045,7 @@ const comandoConfiguracoes = new SlashCommandBuilder()
     .addChannelOption(opt => opt.setName('categoria_canais').setDescription('Categoria').addChannelTypes(ChannelType.GuildCategory).setRequired(true))
     .addRoleOption(opt => opt.setName('cargo_evento').setDescription('Cargo permitido').setRequired(true))
     .addChannelOption(opt => opt.setName('categoria_registros').setDescription('Categoria onde os relatórios finais temporários serão guardados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
+    .addChannelOption(opt => opt.setName('canal_recibos').setDescription('Canal de texto onde o recibo visual (embed) será publicado').addChannelTypes(ChannelType.GuildText).setRequired(false))
     .addChannelOption(opt => opt.setName('categoria_leiloes').setDescription('Categoria onde os canais temporários de leilão serão criados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
     .addRoleOption(opt => opt.setName('cargo_leiloes').setDescription('Cargo responsável por vendas e leilões').setRequired(false))
     .addChannelOption(opt => opt.setName('canal_recibos_integracao').setDescription('Canal onde recibos JSON serão publicados para leitura por outro bot').addChannelTypes(ChannelType.GuildText).setRequired(false))
@@ -2086,16 +2198,18 @@ client.on('interactionCreate', async interaction => {
         const categoria = interaction.options.getChannel('categoria_canais');
         const cargoEvento = interaction.options.getRole('cargo_evento');
         const categoriaRegistros = interaction.options.getChannel('categoria_registros');
+        const canalRecibos = interaction.options.getChannel('canal_recibos');
         const categoriaLeiloes = interaction.options.getChannel('categoria_leiloes');
         const cargoLeiloes = interaction.options.getRole('cargo_leiloes');
         const canalRecibosIntegracao = interaction.options.getChannel('canal_recibos_integracao');
         const canalTaxasGuilda = interaction.options.getChannel('canal_taxas_guilda');
         const canalForumBuilds = interaction.options.getChannel('canal_forum_builds');
-        const configAtual = configuracoesPorGuild.get(interaction.guild.id) || {};
+        const configAtual = obterConfigGuild(interaction.guild.id) || {};
         configuracoesPorGuild.set(interaction.guild.id, {
             categoriaId: categoria.id,
             cargoEventoId: cargoEvento.id,
             categoriaRegistrosId: categoriaRegistros?.id || configAtual.categoriaRegistrosId || null,
+            canalRecibosId: canalRecibos?.id || configAtual.canalRecibosId || null,
             categoriaLeiloesId: categoriaLeiloes?.id || configAtual.categoriaLeiloesId || null,
             cargoLeilaoId: cargoLeiloes?.id || configAtual.cargoLeilaoId || null,
             canalRecibosIntegracaoId: canalRecibosIntegracao?.id || configAtual.canalRecibosIntegracaoId || null,
@@ -2107,6 +2221,9 @@ client.on('interactionCreate', async interaction => {
         const textoRegistros = categoriaRegistros
             ? `\n📁 Categoria de registros: <#${categoriaRegistros.id}>`
             : (configAtual.categoriaRegistrosId ? `\n📁 Categoria de registros mantida: <#${configAtual.categoriaRegistrosId}>` : '\n📁 Categoria de registros: não configurada');
+        const textoCanalRecibos = canalRecibos
+            ? `\n🧾 Canal de recibos (visual): <#${canalRecibos.id}>`
+            : (configAtual.canalRecibosId ? `\n🧾 Canal de recibos (visual) mantido: <#${configAtual.canalRecibosId}>` : '\n🧾 Canal de recibos (visual): não configurado');
         const textoForum = canalForumBuilds
             ? `\n📚 Fórum de builds: <#${canalForumBuilds.id}>`
             : (configAtual.canalForumBuildsId ? `\n📚 Fórum de builds mantido: <#${configAtual.canalForumBuildsId}>` : '\n📚 Fórum de builds: não configurado (configure para link na DM)');
@@ -2122,7 +2239,7 @@ client.on('interactionCreate', async interaction => {
         const textoTaxasGuilda = canalTaxasGuilda
             ? `\n🏛️ Canal de taxas da guilda: <#${canalTaxasGuilda.id}>`
             : (configAtual.canalTaxasGuildaId ? `\n🏛️ Canal de taxas da guilda mantido: <#${configAtual.canalTaxasGuildaId}>` : '\n🏛️ Canal de taxas da guilda: não configurado');
-        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoLeiloes}${textoCargoLeiloes}${textoRecibosIntegracao}${textoTaxasGuilda}${textoForum}`, ephemeral: true });
+        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoCanalRecibos}${textoLeiloes}${textoCargoLeiloes}${textoRecibosIntegracao}${textoTaxasGuilda}${textoForum}`, ephemeral: true });
     }
 
     // COMANDO /EVENTO
@@ -2481,7 +2598,8 @@ client.on('interactionCreate', async interaction => {
 
         const embedSplit = gerarEmbedRegistroEvento(evento, indexGrupo);
         const dmLiderEnviada = await enviarDmUsuario(evento.lider, { embeds: [embedSplit] });
-        const configGuild = configuracoesPorGuild.get(interaction.guild.id);
+        const configGuild = obterConfigGuild(interaction.guild.id);
+        const reciboVisual = await publicarReciboCanalVisual(interaction.guild, configGuild, evento, indexGrupo, embedSplit, 'split_sacolas');
         const reciboIntegracao = await publicarReciboCanalIntegracao(interaction.guild, configGuild, evento, indexGrupo, 'split_sacolas');
         const taxaGuilda = await registrarEPublicarTaxaGuilda(interaction.guild, configGuild, evento, indexGrupo, 'sacolas', totalSacolasBruto, taxaGuildaPercent);
         const registroSplit = await criarCanalRegistroSplit(interaction.guild, evento, indexGrupo, embedSplit, configGuild).catch(error => {
@@ -2504,10 +2622,10 @@ client.on('interactionCreate', async interaction => {
 
         await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
         const textoTaxaGuilda = taxaGuildaValor > 0
-            ? ` Taxa guilda: **${formatarPrata(taxaGuildaValor)}** (${taxaGuilda.registrado ? `registrada em <#${taxaGuilda.channelId}>` : 'canal de taxas não configurado'}).`
+            ? `\n${textoMotivoPublicacao(taxaGuilda, 'Taxa guilda (JSON)')} · Acumulado total: **${formatarPrata(taxaGuilda.cumulativeTotal)}**.`
             : '';
         return interaction.editReply({
-            content: `✅ Split de sacolas concluído. DM do líder: **${dmLiderEnviada ? 'enviada' : 'não entregue'}**. DMs dos participantes com falha: **${falhasDmParticipantes.length}**. Registro: **${registroSplit.criado ? `criado em <#${registroSplit.canalId}>` : 'não criado'}**. Recibo integração: **${reciboIntegracao.publicado ? `enviado em <#${reciboIntegracao.channelId}>` : 'não enviado'}**.${textoTaxaGuilda}\n📦 Agora use **Gerenciar Baú** no relatório para informar print, valor bruto e reparo.`
+            content: `✅ Split de sacolas concluído. DM do líder: **${dmLiderEnviada ? 'enviada' : 'não entregue'}**. DMs dos participantes com falha: **${falhasDmParticipantes.length}**.\n${textoMotivoPublicacao(reciboVisual, 'Recibo visual')}. ${textoMotivoPublicacao(reciboIntegracao, 'Recibo JSON')}. ${textoMotivoPublicacao(registroSplit, 'Registro temporário')}.${textoTaxaGuilda}\n📦 Agora use **Gerenciar Baú** no relatório para informar print, valor bruto e reparo.`
         });
     }
 
@@ -2537,7 +2655,7 @@ client.on('interactionCreate', async interaction => {
         resultado.pagoPorId = interaction.user.id;
         salvarDados();
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
-        const configGuild = configuracoesPorGuild.get(interaction.guild.id);
+        const configGuild = obterConfigGuild(interaction.guild.id);
         await publicarReciboCanalIntegracao(interaction.guild, configGuild, evento, indexGrupo, 'pagamento_sacola');
         return interaction.update(gerarPainelPagamentosGrupo(evento, indexGrupo));
     }
@@ -2560,7 +2678,7 @@ client.on('interactionCreate', async interaction => {
         });
         salvarDados();
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
-        const configGuild = configuracoesPorGuild.get(interaction.guild.id);
+        const configGuild = obterConfigGuild(interaction.guild.id);
         await publicarReciboCanalIntegracao(interaction.guild, configGuild, evento, indexGrupo, 'pagamento_sacola');
         return interaction.update(gerarPainelPagamentosGrupo(evento, indexGrupo));
     }
@@ -2735,7 +2853,9 @@ client.on('interactionCreate', async interaction => {
         }
 
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
-        const configGuildBuyout = configuracoesPorGuild.get(interaction.guild.id);
+        const configGuildBuyout = obterConfigGuild(interaction.guild.id);
+        const embedRegistro = gerarEmbedRegistroEvento(evento, indexGrupo);
+        await publicarReciboCanalVisual(interaction.guild, configGuildBuyout, evento, indexGrupo, embedRegistro, 'split_bau');
         await publicarReciboCanalIntegracao(interaction.guild, configGuildBuyout, evento, indexGrupo, 'split_bau');
         await registrarEPublicarTaxaGuilda(interaction.guild, configGuildBuyout, evento, indexGrupo, 'bau', valorPago, taxaGuildaPercentual);
         await interaction.channel.send({ embeds: gerarEmbedsRegistroEvento(evento, indexGrupo) }).catch(() => null);
@@ -3025,7 +3145,9 @@ client.on('interactionCreate', async interaction => {
         }
 
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
-        const configGuildLeilao = configuracoesPorGuild.get(interaction.guild.id);
+        const configGuildLeilao = obterConfigGuild(interaction.guild.id);
+        const embedRegistro = gerarEmbedRegistroEvento(evento, indexGrupo);
+        await publicarReciboCanalVisual(interaction.guild, configGuildLeilao, evento, indexGrupo, embedRegistro, 'split_bau');
         await publicarReciboCanalIntegracao(interaction.guild, configGuildLeilao, evento, indexGrupo, 'split_bau');
         await registrarEPublicarTaxaGuilda(interaction.guild, configGuildLeilao, evento, indexGrupo, 'bau', leilao.maiorLance, taxaGuildaPercentual);
         await interaction.channel.send({ embeds: gerarEmbedsRegistroEvento(evento, indexGrupo) }).catch(() => null);
