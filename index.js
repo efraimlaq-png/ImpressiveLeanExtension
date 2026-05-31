@@ -16,10 +16,14 @@ const CONFIG_PATH = path.join(__dirname, 'guild-config.json');
 const XP_PATH = path.join(__dirname, 'xp-config.json');
 const REGISTROS_PATH = path.join(__dirname, 'registros-canais.json');
 const EVENTOS_PATH = path.join(__dirname, 'eventos-ativos.json');
-const SALDOS_PATH = path.join(__dirname, 'saldos-membros.json');
+const TAXAS_GUILDA_PATH = path.join(__dirname, 'taxas-guilda.json');
 const xpMembros = new Map();
 const registrosCanais = new Map();
-const saldosMembros = new Map();
+const taxasGuildaAcumulado = new Map();
+const RECIBO_INTEGRACAO_SCHEMA = 'flg-lfg-receipt/v1';
+const RECIBO_INTEGRACAO_MARCADOR = 'FLG_RECEIPT';
+const RECIBO_TAXA_GUILDA_SCHEMA = 'flg-guild-tax/v1';
+const RECIBO_TAXA_GUILDA_MARCADOR = 'FLG_GUILD_TAX';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID || null;
@@ -75,11 +79,13 @@ function carregarDados() {
             });
         } catch (e) { console.error('Erro ao ler eventos-ativos.json', e); }
     }
-    if (fs.existsSync(SALDOS_PATH)) {
+    if (fs.existsSync(TAXAS_GUILDA_PATH)) {
         try {
-            const dados = JSON.parse(fs.readFileSync(SALDOS_PATH, 'utf8'));
-            Object.entries(dados).forEach(([chave, saldo]) => saldosMembros.set(chave, normalizarSaldoMembro(saldo)));
-        } catch (e) { console.error('Erro ao ler saldos-membros.json', e); }
+            const dados = JSON.parse(fs.readFileSync(TAXAS_GUILDA_PATH, 'utf8'));
+            Object.entries(dados).forEach(([guildId, total]) => {
+                taxasGuildaAcumulado.set(guildId, Math.max(0, Math.floor(Number(total) || 0)));
+            });
+        } catch (e) { console.error('Erro ao ler taxas-guilda.json', e); }
     }
 }
 
@@ -97,8 +103,9 @@ function salvarDados() {
         const objetoEventos = Object.fromEntries(eventosAtivos.entries());
         fs.writeFileSync(EVENTOS_PATH, JSON.stringify(objetoEventos, null, 2), 'utf8');
 
-        const objetoSaldos = Object.fromEntries(saldosMembros.entries());
-        fs.writeFileSync(SALDOS_PATH, JSON.stringify(objetoSaldos, null, 2), 'utf8');
+        const objetoTaxasGuilda = Object.fromEntries(taxasGuildaAcumulado.entries());
+        fs.writeFileSync(TAXAS_GUILDA_PATH, JSON.stringify(objetoTaxasGuilda, null, 2), 'utf8');
+
     } catch (e) { console.error('Erro ao salvar arquivos de banco de dados locais', e); }
 }
 carregarDados();
@@ -352,6 +359,39 @@ function formatarPercentual(valor) {
     return `${parsePercentualDesconto(valor).toLocaleString('pt-BR', { maximumFractionDigits: 2 })}%`;
 }
 
+function parseDescontoETaxaGuilda(texto, descontoPadrao = 20, taxaPadrao = 0) {
+    const partes = String(texto || '').split(/[|/,]/).map(item => item.trim()).filter(Boolean);
+    if (partes.length >= 2) {
+        return {
+            descontoPercentual: parsePercentualDesconto(partes[0], descontoPadrao),
+            taxaGuildaPercentual: parsePercentualDesconto(partes[1], taxaPadrao)
+        };
+    }
+    return {
+        descontoPercentual: parsePercentualDesconto(texto, descontoPadrao),
+        taxaGuildaPercentual: taxaPadrao
+    };
+}
+
+function calcularTaxaGuilda(valorBase, taxaPercentual) {
+    const base = Math.max(0, Math.floor(Number(valorBase) || 0));
+    const percentual = parsePercentualDesconto(taxaPercentual, 0);
+    return Math.floor(base * (percentual / 100));
+}
+
+function obterTotalTaxasGuilda(guildId) {
+    return taxasGuildaAcumulado.get(guildId) || 0;
+}
+
+function registrarTaxaGuildaAcumulada(guildId, valor) {
+    const incremento = Math.max(0, Math.floor(Number(valor) || 0));
+    if (incremento <= 0) return obterTotalTaxasGuilda(guildId);
+    const novoTotal = obterTotalTaxasGuilda(guildId) + incremento;
+    taxasGuildaAcumulado.set(guildId, novoTotal);
+    salvarDados();
+    return novoTotal;
+}
+
 function formatarPrata(valor) {
     return `${Math.max(0, Math.floor(Number(valor) || 0)).toLocaleString('pt-BR')} Pratas`;
 }
@@ -399,312 +439,163 @@ function criarEmbedsImagensBau(bau, titulo = 'Print do baú') {
     );
 }
 
-function chaveSaldo(guildId, userId) {
-    return `${guildId}_${userId}`;
-}
-
-function normalizarSaldoMembro(saldo) {
-    const normalizado = {
-        guildId: saldo?.guildId || null,
-        userId: saldo?.userId || null,
-        lancamentos: Array.isArray(saldo?.lancamentos) ? saldo.lancamentos : [],
-        resgates: Array.isArray(saldo?.resgates) ? saldo.resgates : []
-    };
-
-    normalizado.lancamentos = normalizado.lancamentos.map(lancamento => ({
-        id: String(lancamento.id || ''),
-        guildId: lancamento.guildId || normalizado.guildId,
-        userId: lancamento.userId || normalizado.userId,
-        eventoId: lancamento.eventoId || null,
-        grupoIndex: Number.isInteger(lancamento.grupoIndex) ? lancamento.grupoIndex : parseInt(lancamento.grupoIndex ?? 0, 10),
-        tipo: lancamento.tipo || 'split',
-        descricao: lancamento.descricao || 'Split',
-        valor: Math.max(0, Math.floor(Number(lancamento.valor) || 0)),
-        status: lancamento.status || 'disponivel',
-        criadoEmMs: lancamento.criadoEmMs || Date.now(),
-        solicitadoEmMs: lancamento.solicitadoEmMs || null,
-        pagoEmMs: lancamento.pagoEmMs || null,
-        pagoPorId: lancamento.pagoPorId || null,
-        resgateId: lancamento.resgateId || null,
-        editadoPorId: lancamento.editadoPorId || null,
-        transferenciaRefId: lancamento.transferenciaRefId || null
-    })).filter(lancamento => lancamento.id);
-
-    normalizado.resgates = normalizado.resgates.map(resgate => ({
-        id: String(resgate.id || ''),
-        valorTotal: Math.max(0, Math.floor(Number(resgate.valorTotal) || 0)),
-        status: resgate.status || 'solicitado',
-        solicitadoEmMs: resgate.solicitadoEmMs || Date.now(),
-        pagoEmMs: resgate.pagoEmMs || null,
-        pagoPorId: resgate.pagoPorId || null,
-        lancamentoIds: Array.isArray(resgate.lancamentoIds) ? resgate.lancamentoIds : []
-    })).filter(resgate => resgate.id);
-
-    return normalizado;
-}
-
-function obterSaldoMembro(guildId, userId) {
-    const chave = chaveSaldo(guildId, userId);
-    const existente = saldosMembros.get(chave);
-    if (existente) return existente;
-    const novo = { guildId, userId, lancamentos: [], resgates: [] };
-    saldosMembros.set(chave, novo);
-    return novo;
-}
-
-function idLancamentoSacola(eventoId, indexGrupo, userId) {
-    return `sacola_${eventoId}_${normalizarIndexGrupo(indexGrupo)}_${userId}`;
-}
-
-function idLancamentoBau(eventoId, indexGrupo, userId) {
-    return `bau_${eventoId}_${normalizarIndexGrupo(indexGrupo)}_${userId}`;
-}
-
-function registrarLancamentoSaldo(guildId, userId, lancamento) {
-    if (!lancamento?.id || !lancamento.valor) return null;
-    const saldo = obterSaldoMembro(guildId, userId);
-    const atual = saldo.lancamentos.find(item => item.id === lancamento.id);
-    if (atual) {
-        Object.assign(atual, { ...lancamento, status: atual.status, resgateId: atual.resgateId, solicitadoEmMs: atual.solicitadoEmMs, pagoEmMs: atual.pagoEmMs, pagoPorId: atual.pagoPorId });
-        return atual;
-    }
-    const novo = {
-        guildId,
-        userId,
-        status: 'disponivel',
-        criadoEmMs: Date.now(),
-        solicitadoEmMs: null,
-        pagoEmMs: null,
-        pagoPorId: null,
-        resgateId: null,
-        ...lancamento
-    };
-    saldo.lancamentos.push(novo);
-    return novo;
-}
-
-function marcarLancamentoSaldoPago(guildId, userId, lancamentoId, pagoPorId) {
-    const saldo = obterSaldoMembro(guildId, userId);
-    const lancamento = saldo.lancamentos.find(item => item.id === lancamentoId);
-    if (!lancamento) return false;
-    lancamento.status = 'pago';
-    lancamento.pagoEmMs = Date.now();
-    lancamento.pagoPorId = pagoPorId;
-    if (lancamento.resgateId) {
-        const resgate = saldo.resgates.find(item => item.id === lancamento.resgateId);
-        const todosPagos = resgate?.lancamentoIds?.every(id => saldo.lancamentos.find(item => item.id === id)?.status === 'pago');
-        if (resgate && todosPagos) {
-            resgate.status = 'pago';
-            resgate.pagoEmMs = Date.now();
-            resgate.pagoPorId = pagoPorId;
-        }
-    }
-    return true;
-}
-
-function registrarSplitSacolaNoSaldo(evento, indexGrupo, resultado) {
-    if (!resultado?.valor) return null;
+function montarPayloadReciboIntegracao(evento, indexGrupo, tipoEvento) {
     const idx = normalizarIndexGrupo(indexGrupo);
-    return registrarLancamentoSaldo(evento.guildId, resultado.userId, {
-        id: idLancamentoSacola(evento.id, idx, resultado.userId),
-        eventoId: evento.id,
-        grupoIndex: idx,
-        tipo: 'sacolas',
-        descricao: `Sacolas - ${evento.nome} | Grupo ${idx + 1}`,
-        valor: resultado.valor
-    });
+    const grupo = evento.grupos[idx];
+    const split = grupo.splitSacolas;
+    const bau = grupo.bau || criarEstadoBauPadrao();
+    const participantesPorId = Object.fromEntries((grupo.participantes || []).map(p => [p.id, p]));
+
+    return {
+        schema: RECIBO_INTEGRACAO_SCHEMA,
+        marker: RECIBO_INTEGRACAO_MARCADOR,
+        eventType: tipoEvento,
+        generatedAt: new Date().toISOString(),
+        guildId: evento.guildId,
+        event: {
+            id: evento.id,
+            name: evento.nome,
+            leaderId: evento.lider,
+            createdById: evento.criadoPorId,
+            tier: evento.tierEquipamento || null,
+            ip: evento.ipBuild || null,
+            buildForumTitle: evento.tituloBuildForum || null
+        },
+        group: {
+            index: idx,
+            number: idx + 1,
+            schedule: grupo.horario,
+            closed: Boolean(grupo.fechado),
+            closedAt: grupo.fechadoEmMs ? new Date(grupo.fechadoEmMs).toISOString() : null
+        },
+        bags: {
+            totalGross: split?.totalSacolas ?? obterSacolaTotal(grupo),
+            guildTaxPercent: split?.taxaGuildaPercent ?? 0,
+            guildTaxAmount: split?.taxaGuildaValor ?? 0,
+            totalForSplit: split?.totalParaSplit ?? split?.totalSacolas ?? obterSacolaTotal(grupo),
+            totalActiveMs: split?.totalMs || 0,
+            calculatedAt: split?.calculadoEmMs ? new Date(split.calculadoEmMs).toISOString() : null,
+            calculatedById: split?.calculadoPorId || null,
+            entries: (split?.resultados || []).map(resultado => ({
+                userId: resultado.userId,
+                activeMs: resultado.tempoMs,
+                amount: resultado.valor,
+                xpGained: Math.floor(resultado.xpGanho || 0),
+                paid: Boolean(resultado.pago),
+                paidAt: resultado.pagoEmMs ? new Date(resultado.pagoEmMs).toISOString() : null,
+                paidById: resultado.pagoPorId || null,
+                role: participantesPorId[resultado.userId]?.role || null,
+                weapon: participantesPorId[resultado.userId]?.arma || null
+            }))
+        },
+        chest: {
+            status: bau.status,
+            location: bau.localLoot || null,
+            grossValue: bau.valorBruto || 0,
+            repairValue: bau.valorReparo || 0,
+            netValue: bau.valorLiquido || 0,
+            discountPercent: bau.descontoPercentual ?? null,
+            guildTaxPercent: bau.taxaGuildaPercentual ?? 0,
+            guildTaxAmount: bau.taxaGuildaValor ?? 0,
+            buyerId: bau.compradorId || null,
+            paidValue: bau.valorPago || 0,
+            closedAt: bau.encerradoEmMs ? new Date(bau.encerradoEmMs).toISOString() : null,
+            split: (bau.splitFinal?.resultados || []).map(resultado => ({
+                userId: resultado.userId,
+                activeMs: resultado.tempoMs,
+                amount: resultado.valor
+            }))
+        }
+    };
 }
 
-function registrarSplitBauNoSaldo(evento, indexGrupo, resultado, origem) {
-    if (!resultado?.valor) return null;
+async function publicarReciboCanalIntegracao(guild, configGuild, evento, indexGrupo, tipoEvento) {
+    const channelId = configGuild?.canalRecibosIntegracaoId;
+    if (!guild || !channelId) return { publicado: false, motivo: 'canal_nao_configurado' };
+
+    const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (!canal?.isTextBased?.()) return { publicado: false, motivo: 'canal_invalido' };
+
     const idx = normalizarIndexGrupo(indexGrupo);
-    return registrarLancamentoSaldo(evento.guildId, resultado.userId, {
-        id: idLancamentoBau(evento.id, idx, resultado.userId),
-        eventoId: evento.id,
-        grupoIndex: idx,
-        tipo: 'bau',
-        descricao: `${origem || 'Baú'} - ${evento.nome} | Grupo ${idx + 1}`,
-        valor: resultado.valor
+    const payload = montarPayloadReciboIntegracao(evento, idx, tipoEvento);
+    const json = JSON.stringify(payload);
+    const nomeArquivo = `flg-recibo-${evento.id}-g${idx + 1}-${tipoEvento}.json`;
+
+    const mensagem = await canal.send({
+        content: `${RECIBO_INTEGRACAO_MARCADOR} ${RECIBO_INTEGRACAO_SCHEMA} | ${tipoEvento} | evento:${evento.id} | grupo:${idx + 1}`,
+        files: [{ attachment: Buffer.from(json, 'utf8'), name: nomeArquivo }]
+    }).catch(error => {
+        console.error('Erro ao publicar recibo de integração:', error);
+        return null;
     });
+
+    return mensagem
+        ? { publicado: true, channelId: canal.id, messageId: mensagem.id }
+        : { publicado: false, motivo: 'falha_ao_enviar' };
 }
 
-function marcarSacolaPagaNoSaldo(evento, indexGrupo, userId, pagoPorId) {
-    return marcarLancamentoSaldoPago(evento.guildId, userId, idLancamentoSacola(evento.id, indexGrupo, userId), pagoPorId);
-}
-
-async function usuarioPodeGerenciarSaldo(interaction, guildId) {
-    return usuarioPodeOperarLeilao(interaction, guildId);
-}
-
-function calcularTotalDisponivelSaldo(saldo) {
-    return saldo.lancamentos
-        .filter(item => item.status === 'disponivel' && item.valor > 0)
-        .reduce((acc, item) => acc + item.valor, 0);
-}
-
-function calcularTotalDebitoSaldo(saldo) {
-    return saldo.lancamentos
-        .filter(item => item.status === 'debito' && item.valor > 0)
-        .reduce((acc, item) => acc + item.valor, 0);
-}
-
-function idLancamentoManual(prefixo, guildId, userId) {
-    return `${prefixo}_${guildId}_${userId}_${Date.now()}`;
-}
-
-function registrarLancamentoManual(guildId, userId, lancamento, operadorId) {
-    if (!lancamento?.valor || lancamento.valor <= 0) return { ok: false, erro: 'Valor inválido.' };
-    const id = lancamento.id || idLancamentoManual(lancamento.tipo || 'ajuste', guildId, userId);
-    const criado = registrarLancamentoSaldo(guildId, userId, {
-        eventoId: null,
-        grupoIndex: null,
-        criadoEmMs: Date.now(),
-        editadoPorId: operadorId,
-        ...lancamento,
-        id,
-        status: lancamento.status || 'disponivel'
-    });
-    if (!criado) return { ok: false, erro: 'Não foi possível registrar o lançamento.' };
-    salvarDados();
-    return { ok: true, lancamento: criado };
-}
-
-function removerCreditoSaldo(guildId, userId, valor, operadorId, motivo = 'Ajuste manual') {
-    const valorRemover = Math.floor(Number(valor) || 0);
-    if (valorRemover <= 0) return { ok: false, erro: 'Informe um valor maior que zero.' };
-
-    const saldo = obterSaldoMembro(guildId, userId);
-    const disponiveis = saldo.lancamentos
-        .filter(item => item.status === 'disponivel' && item.valor > 0)
-        .sort((a, b) => (a.criadoEmMs || 0) - (b.criadoEmMs || 0));
-
-    const totalDisponivel = disponiveis.reduce((acc, item) => acc + item.valor, 0);
-    if (totalDisponivel < valorRemover) {
-        return { ok: false, erro: `Saldo disponível insuficiente. Disponível: ${formatarPrata(totalDisponivel)}.` };
-    }
-
-    let restante = valorRemover;
-    for (const lancamento of disponiveis) {
-        if (restante <= 0) break;
-        if (lancamento.valor <= restante) {
-            restante -= lancamento.valor;
-            lancamento.valor = 0;
-            lancamento.status = 'pago';
-            lancamento.pagoEmMs = Date.now();
-            lancamento.pagoPorId = operadorId;
-        } else {
-            lancamento.valor -= restante;
-            restante = 0;
+function montarPayloadReciboTaxaGuilda(evento, indexGrupo, source, dadosTaxa) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
+    return {
+        schema: RECIBO_TAXA_GUILDA_SCHEMA,
+        marker: RECIBO_TAXA_GUILDA_MARCADOR,
+        source,
+        generatedAt: new Date().toISOString(),
+        guildId: evento.guildId,
+        amount: dadosTaxa.amount,
+        taxPercent: dadosTaxa.taxPercent,
+        baseValue: dadosTaxa.baseValue,
+        cumulativeTotal: dadosTaxa.cumulativeTotal,
+        event: {
+            id: evento.id,
+            name: evento.nome,
+            leaderId: evento.lider,
+            createdById: evento.criadoPorId,
+            groupNumber: idx + 1,
+            schedule: grupo?.horario || null
         }
-    }
-
-    saldo.lancamentos.push({
-        id: idLancamentoManual('remocao', guildId, userId),
-        guildId,
-        userId,
-        eventoId: null,
-        grupoIndex: null,
-        tipo: 'ajuste',
-        descricao: motivo,
-        valor: valorRemover,
-        status: 'pago',
-        criadoEmMs: Date.now(),
-        solicitadoEmMs: null,
-        pagoEmMs: Date.now(),
-        pagoPorId: operadorId,
-        resgateId: null,
-        editadoPorId: operadorId,
-        transferenciaRefId: null
-    });
-
-    salvarDados();
-    return { ok: true, valorRemovido: valorRemover, saldoRestante: calcularTotalDisponivelSaldo(saldo) };
+    };
 }
 
-function quitarDebitoSaldo(guildId, userId, valor, operadorId, motivo = 'Quitação de pendência') {
-    const valorQuitar = Math.floor(Number(valor) || 0);
-    if (valorQuitar <= 0) return { ok: false, erro: 'Informe um valor maior que zero.' };
+async function publicarReciboTaxaGuilda(guild, configGuild, evento, indexGrupo, source, dadosTaxa) {
+    const channelId = configGuild?.canalTaxasGuildaId;
+    if (!guild || !channelId || !dadosTaxa?.amount) return { publicado: false, motivo: 'canal_nao_configurado' };
 
-    const saldo = obterSaldoMembro(guildId, userId);
-    const debitos = saldo.lancamentos
-        .filter(item => item.status === 'debito' && item.valor > 0)
-        .sort((a, b) => (a.criadoEmMs || 0) - (b.criadoEmMs || 0));
+    const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (!canal?.isTextBased?.()) return { publicado: false, motivo: 'canal_invalido' };
 
-    const totalDebito = debitos.reduce((acc, item) => acc + item.valor, 0);
-    if (totalDebito < valorQuitar) {
-        return { ok: false, erro: `Débito pendente insuficiente. Pendente: ${formatarPrata(totalDebito)}.` };
-    }
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const payload = montarPayloadReciboTaxaGuilda(evento, idx, source, dadosTaxa);
+    const json = JSON.stringify(payload);
+    const nomeArquivo = `flg-taxa-guilda-${evento.id}-g${idx + 1}-${source}.json`;
 
-    let restante = valorQuitar;
-    for (const lancamento of debitos) {
-        if (restante <= 0) break;
-        if (lancamento.valor <= restante) {
-            restante -= lancamento.valor;
-            lancamento.valor = 0;
-            lancamento.status = 'pago';
-            lancamento.pagoEmMs = Date.now();
-            lancamento.pagoPorId = operadorId;
-        } else {
-            lancamento.valor -= restante;
-            restante = 0;
-        }
-    }
-
-    saldo.lancamentos.push({
-        id: idLancamentoManual('quitacao', guildId, userId),
-        guildId,
-        userId,
-        eventoId: null,
-        grupoIndex: null,
-        tipo: 'debito',
-        descricao: motivo,
-        valor: valorQuitar,
-        status: 'pago',
-        criadoEmMs: Date.now(),
-        solicitadoEmMs: null,
-        pagoEmMs: Date.now(),
-        pagoPorId: operadorId,
-        resgateId: null,
-        editadoPorId: operadorId,
-        transferenciaRefId: null
+    const mensagem = await canal.send({
+        content: `${RECIBO_TAXA_GUILDA_MARCADOR} ${RECIBO_TAXA_GUILDA_SCHEMA} | ${source} | +${formatarPrata(dadosTaxa.amount)} | acumulado:${formatarPrata(dadosTaxa.cumulativeTotal)} | evento:${evento.id} | grupo:${idx + 1}`,
+        files: [{ attachment: Buffer.from(json, 'utf8'), name: nomeArquivo }]
+    }).catch(error => {
+        console.error('Erro ao publicar recibo de taxa da guilda:', error);
+        return null;
     });
 
-    salvarDados();
-    return { ok: true, valorQuitado: valorQuitar, debitoRestante: calcularTotalDebitoSaldo(saldo) };
+    return mensagem
+        ? { publicado: true, channelId: canal.id, messageId: mensagem.id }
+        : { publicado: false, motivo: 'falha_ao_enviar' };
 }
 
-function transferirSaldoEntreMembros(guildId, origemId, destinoId, valor, operadorId, motivo = 'Transferência manual') {
-    if (origemId === destinoId) return { ok: false, erro: 'Origem e destino devem ser membros diferentes.' };
+async function registrarEPublicarTaxaGuilda(guild, configGuild, evento, indexGrupo, source, baseValue, taxPercent) {
+    const amount = calcularTaxaGuilda(baseValue, taxPercent);
+    if (amount <= 0) return { registrado: false, amount: 0 };
 
-    const valorTransferir = Math.floor(Number(valor) || 0);
-    if (valorTransferir <= 0) return { ok: false, erro: 'Informe um valor maior que zero.' };
+    const cumulativeTotal = registrarTaxaGuildaAcumulada(evento.guildId, amount);
+    const publicacao = await publicarReciboTaxaGuilda(guild, configGuild, evento, indexGrupo, source, {
+        amount,
+        taxPercent: parsePercentualDesconto(taxPercent, 0),
+        baseValue: Math.max(0, Math.floor(Number(baseValue) || 0)),
+        cumulativeTotal
+    });
 
-    const refId = `transfer_${Date.now()}`;
-    const remocao = removerCreditoSaldo(guildId, origemId, valorTransferir, operadorId, `${motivo} → <@${destinoId}>`);
-    if (!remocao.ok) return remocao;
-
-    const credito = registrarLancamentoManual(guildId, destinoId, {
-        tipo: 'transferencia',
-        descricao: `${motivo} ← <@${origemId}>`,
-        valor: valorTransferir,
-        status: 'disponivel',
-        transferenciaRefId: refId
-    }, operadorId);
-
-    if (!credito.ok) {
-        registrarLancamentoManual(guildId, origemId, {
-            tipo: 'ajuste',
-            descricao: `Estorno automático — falha na transferência para <@${destinoId}>`,
-            valor: valorTransferir,
-            status: 'disponivel',
-            transferenciaRefId: refId
-        }, operadorId);
-        return { ok: false, erro: 'Falha ao creditar o destino. O valor foi estornado à origem.' };
-    }
-
-    credito.lancamento.transferenciaRefId = refId;
-    salvarDados();
-    return { ok: true, valorTransferido: valorTransferir, refId };
+    return { registrado: publicacao.publicado, amount, cumulativeTotal, ...publicacao };
 }
 
 function obterSacolaTotal(grupo) {
@@ -730,6 +621,8 @@ function criarEstadoBauPadrao() {
         decisao: null,
         compradorId: null,
         valorPago: 0,
+        taxaGuildaPercentual: 0,
+        taxaGuildaValor: 0,
         splitFinal: null,
         leilao: null
     };
@@ -745,6 +638,9 @@ function normalizarSplitSacolasPersistido(splitSacolas) {
         resultado.xpGanho = Number(resultado.xpGanho) || 0;
     });
     splitSacolas.totalSacolas = Math.max(0, Math.floor(Number(splitSacolas.totalSacolas) || 0));
+    splitSacolas.totalParaSplit = Math.max(0, Math.floor(Number(splitSacolas.totalParaSplit ?? splitSacolas.totalSacolas) || 0));
+    splitSacolas.taxaGuildaPercent = parsePercentualDesconto(splitSacolas.taxaGuildaPercent, 0);
+    splitSacolas.taxaGuildaValor = Math.max(0, Math.floor(Number(splitSacolas.taxaGuildaValor) || 0));
     splitSacolas.totalMs = Math.max(0, Math.floor(Number(splitSacolas.totalMs) || 0));
     splitSacolas.falhasDmParticipantes = Array.isArray(splitSacolas.falhasDmParticipantes) ? splitSacolas.falhasDmParticipantes : [];
     return splitSacolas;
@@ -756,6 +652,8 @@ function normalizarBauPersistido(bau) {
     normalizado.valorReparo = Math.max(0, Math.floor(Number(normalizado.valorReparo) || 0));
     normalizado.valorLiquido = Math.max(0, Math.floor(Number(normalizado.valorLiquido ?? (normalizado.valorBruto - normalizado.valorReparo)) || 0));
     normalizado.valorPago = Math.max(0, Math.floor(Number(normalizado.valorPago) || 0));
+    normalizado.taxaGuildaPercentual = parsePercentualDesconto(normalizado.taxaGuildaPercentual, 0);
+    normalizado.taxaGuildaValor = Math.max(0, Math.floor(Number(normalizado.taxaGuildaValor) || 0));
     normalizado.localLoot = normalizado.localLoot ? limitarTexto(normalizado.localLoot, 80) : null;
     normalizado.descontoPercentual = parsePercentualDesconto(normalizado.descontoPercentual, 20);
     normalizado.printUrls = obterPrintUrlsBau(normalizado);
@@ -1246,7 +1144,9 @@ function gerarEmbedRegistroEvento(evento, indexGrupo) {
         .setColor(grupo.bau?.status === STATUS_LEILAO_ABERTO ? '#3498db' : grupo.bau?.status === STATUS_LEILAO_REVISAO ? '#f39c12' : '#f1c40f')
         .setDescription(
             `${textoRequisitosBuild(evento, configuracoesPorGuild.get(evento.guildId))}\n` +
-            `💰 **Sacolas/Prata Bruta:** ${formatarPrata(split?.totalSacolas ?? obterSacolaTotal(grupo))}\n` +
+            `💰 **Sacolas/Prata Bruta:** ${formatarPrata(split?.totalSacolas ?? obterSacolaTotal(grupo))}` +
+            (split?.taxaGuildaValor ? `\n🏛️ **Taxa da guilda (${formatarPercentual(split.taxaGuildaPercent)}):** ${formatarPrata(split.taxaGuildaValor)}` : '') +
+            `\n💵 **Total splitado entre a PT:** ${formatarPrata(split?.totalParaSplit ?? split?.totalSacolas ?? obterSacolaTotal(grupo))}\n` +
             `⏱️ **Soma do Tempo Total da PT:** ${formatarDuracaoMs(split?.totalMs || 0)}\n` +
             `📍 **Local do loot:** ${grupo.bau?.localLoot || 'não informado'}\n` +
             `📦 **Baú:** ${textoStatusBau(grupo)}\n\n` +
@@ -1352,11 +1252,13 @@ function gerarPainelBauGrupo(evento, indexGrupo) {
         `Status: ${textoStatusBau(grupo)}`,
         `Local do loot: **${bau.localLoot || 'não informado'}**`,
         `Desconto do leilão: **${formatarPercentual(bau.descontoPercentual)}**`,
+        bau.taxaGuildaPercentual > 0 ? `Taxa da guilda: **${formatarPercentual(bau.taxaGuildaPercentual)}**` : null,
+        bau.taxaGuildaValor > 0 ? `Taxa da guilda retida: **${formatarPrata(bau.taxaGuildaValor)}**` : null,
         `Valor bruto: **${formatarPrata(bau.valorBruto)}**`,
         `Reparo: **${formatarPrata(bau.valorReparo)}**`,
         `Líquido estimado: **${formatarPrata(bau.valorLiquido)}**`,
         resumirPrintsBau(bau)
-    ];
+    ].filter(Boolean);
 
     if (bau.status === 'nao_informado' || bau.status === 'sem_bau') {
         return {
@@ -1391,7 +1293,7 @@ function gerarPainelBauGrupo(evento, indexGrupo) {
     return { content: linhas.join('\n'), components: [], ephemeral: true };
 }
 
-function criarModalBau(idEvento, indexGrupo, printUrl = '') {
+function criarModalBau(idEvento, indexGrupo, printUrl = '', bauAtual = null) {
     const inputPrint = new TextInputBuilder()
         .setCustomId('bau_print_url')
         .setLabel('URLs dos prints do baú')
@@ -1400,13 +1302,39 @@ function criarModalBau(idEvento, indexGrupo, printUrl = '') {
         .setRequired(false);
     if (printUrl) inputPrint.setValue(limitarTexto(printUrl, 4000));
 
+    const bau = bauAtual || criarEstadoBauPadrao();
+    const inputDescontoTaxa = new TextInputBuilder()
+        .setCustomId('bau_desconto')
+        .setLabel('Desconto lance (%) | Taxa guilda (%)')
+        .setPlaceholder('Ex: 20 | 10')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(`${bau.descontoPercentual ?? 20} | ${bau.taxaGuildaPercentual ?? 0}`);
+
     const modal = new ModalBuilder().setCustomId(`modal_bau_${idEvento}_${indexGrupo}`).setTitle('Dados do Baú');
     modal.addComponents(
         new ActionRowBuilder().addComponents(inputPrint),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_local').setLabel('Local onde o loot está').setPlaceholder('Ex: Brecilia, Thetford, Martlock...').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_bruto').setLabel('Valor total estimado do loot').setPlaceholder('Ex: 5.500.000').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_reparo').setLabel('Valor estimado do reparo').setPlaceholder('Ex: 350.000').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_desconto').setLabel('Desconto para lance inicial (%)').setPlaceholder('Ex: 20 para 20%').setStyle(TextInputStyle.Short).setRequired(true))
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_local').setLabel('Local onde o loot está').setPlaceholder('Ex: Brecilia, Thetford, Martlock...').setStyle(TextInputStyle.Short).setRequired(true).setValue(bau.localLoot || '')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_bruto').setLabel('Valor total estimado do loot').setPlaceholder('Ex: 5.500.000').setStyle(TextInputStyle.Short).setRequired(true).setValue(bau.valorBruto > 0 ? String(bau.valorBruto) : '')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_reparo').setLabel('Valor estimado do reparo').setPlaceholder('Ex: 350.000').setStyle(TextInputStyle.Short).setRequired(true).setValue(bau.valorReparo > 0 ? String(bau.valorReparo) : '')),
+        new ActionRowBuilder().addComponents(inputDescontoTaxa)
+    );
+    return modal;
+}
+
+function criarModalCalcSplitSacolas(idEvento, indexGrupo, grupo) {
+    const totalAtual = formatarPrata(obterSacolaTotal(grupo));
+    const modal = new ModalBuilder().setCustomId(`modal_calc_split_${idEvento}_${indexGrupo}`).setTitle('Finalizar Split de Sacolas');
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+                .setCustomId('taxa_guilda')
+                .setLabel('Taxa da guilda sobre as sacolas (%)')
+                .setPlaceholder(`Total atual: ${totalAtual}. Ex: 10 para 10%`)
+                .setStyle(TextInputStyle.Short)
+                .setRequired(false)
+                .setValue('0')
+        )
     );
     return modal;
 }
@@ -1598,80 +1526,6 @@ async function atualizarRegistroEvento(guild, evento, indexGrupo) {
     }
 }
 
-function obterLeiloesAtivosUsuario(guildId, userId) {
-    const leiloes = [];
-    for (const [, evento] of eventosAtivos) {
-        if (evento.guildId !== guildId) continue;
-        evento.grupos.forEach((grupo, index) => {
-            if (grupo?.bau?.status !== STATUS_LEILAO_ABERTO) return;
-            if (!grupo.participantes?.some(p => p.id === userId)) return;
-            leiloes.push({
-                eventoNome: evento.nome,
-                grupo: index + 1,
-                localLoot: grupo.bau.localLoot || 'não informado',
-                lanceAtual: grupo.bau.leilao?.maiorLance || grupo.bau.leilao?.lanceInicial || 0,
-                channelId: grupo.bau.leilao?.channelId || null
-            });
-        });
-    }
-    return leiloes;
-}
-
-function linhasLancamentosSaldo(lancamentos, limite = 8) {
-    const lista = lancamentos.slice(-limite).reverse();
-    return lista.map(item => {
-        const icone = item.status === 'debito' ? '🔴' : '•';
-        return `${icone} **${formatarPrata(item.valor)}** — ${item.descricao}`;
-    });
-}
-
-function gerarEmbedSaldo(guildId, userId, opcoes = {}) {
-    const saldo = obterSaldoMembro(guildId, userId);
-    const disponiveis = saldo.lancamentos.filter(item => item.status === 'disponivel' && item.valor > 0);
-    const solicitados = saldo.lancamentos.filter(item => item.status === 'solicitado' && item.valor > 0);
-    const pagos = saldo.lancamentos.filter(item => item.status === 'pago' && item.valor > 0);
-    const debitos = saldo.lancamentos.filter(item => item.status === 'debito' && item.valor > 0);
-    const leiloes = obterLeiloesAtivosUsuario(guildId, userId);
-    const totalDisponivel = calcularTotalDisponivelSaldo(saldo);
-    const totalSolicitado = solicitados.reduce((acc, item) => acc + item.valor, 0);
-    const totalDebito = calcularTotalDebitoSaldo(saldo);
-    const saldoLiquido = totalDisponivel - totalDebito;
-    const tituloMembro = opcoes.consultaAdmin ? `💼 Saldo de <@${userId}>` : '💼 Seu saldo de splits';
-
-    const embed = new EmbedBuilder()
-        .setTitle(tituloMembro)
-        .setColor(saldoLiquido > 0 ? '#2ecc71' : totalDebito > 0 ? '#e74c3c' : '#95a5a6')
-        .setDescription(
-            `Saldo disponível para resgate: **${formatarPrata(totalDisponivel)}**\n` +
-            `Débitos pendentes: **${formatarPrata(totalDebito)}**\n` +
-            `Saldo líquido: **${formatarPrata(Math.max(0, saldoLiquido))}**${totalDebito > totalDisponivel ? ' *(negativo)*' : ''}\n` +
-            `Resgates aguardando pagamento: **${formatarPrata(totalSolicitado)}**`
-        );
-
-    adicionarCampoLongo(embed, 'Disponível para resgate', linhasLancamentosSaldo(disponiveis).join('\n') || 'Nada disponível no momento.');
-    adicionarCampoLongo(embed, 'Débitos / pendências', linhasLancamentosSaldo(debitos).join('\n') || 'Nenhum débito registrado.');
-    adicionarCampoLongo(embed, 'Pendente de pagamento', linhasLancamentosSaldo(solicitados).join('\n') || 'Nenhum resgate solicitado.');
-    adicionarCampoLongo(embed, 'Em leilão', leiloes.map(item => `• ${item.eventoNome} | Grupo ${item.grupo} | ${item.localLoot} | ${item.channelId ? `<#${item.channelId}>` : 'canal não localizado'} | referência: **${formatarPrata(item.lanceAtual)}**`).join('\n') || 'Nenhum baú seu está em leilão agora.');
-    adicionarCampoLongo(embed, 'Últimos pagos', linhasLancamentosSaldo(pagos, 5).join('\n') || 'Nenhum pagamento registrado.');
-    return embed;
-}
-
-function gerarComponentesSaldo(guildId, userId, viewerId = null) {
-    const saldo = obterSaldoMembro(guildId, userId);
-    const totalDisponivel = calcularTotalDisponivelSaldo(saldo);
-    const totalDebito = calcularTotalDebitoSaldo(saldo);
-    const podeResgatar = totalDisponivel > 0 && totalDebito === 0;
-    const ehDono = !viewerId || viewerId === userId;
-    const componentes = [];
-
-    if (ehDono && podeResgatar) {
-        componentes.push(new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`saldo_resgate_${guildId}_${userId}`).setLabel('Solicitar Resgate').setEmoji('💸').setStyle(ButtonStyle.Success)
-        ));
-    }
-    return componentes;
-}
-
 async function enviarDmResponsaveisLeilao(guild, configGuild, payload) {
     if (!guild || !configGuild?.cargoLeilaoId) return 0;
     const membros = guild.members.cache.filter(membro => membro.roles.cache.has(configGuild.cargoLeilaoId) && !membro.user.bot);
@@ -1738,269 +1592,6 @@ async function enviarLeilaoParaRevisao(guild, evento, indexGrupo, motivo = 'praz
     await atualizarRegistroEvento(guild, evento, idx);
     salvarDados();
     return true;
-}
-
-async function solicitarResgateSaldo(interaction, guildId, userId) {
-    if (interaction.user.id !== userId) {
-        return interaction.reply({ content: '❌ Você só pode solicitar resgate do seu próprio saldo.', ephemeral: true });
-    }
-
-    const guild = interaction.guild || client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
-    const configGuild = configuracoesPorGuild.get(guildId);
-    if (!configGuild?.cargoLeilaoId) {
-        return interaction.reply({ content: '❌ O cargo responsável por leilões/resgates ainda não foi configurado em /configuracoes.', ephemeral: true });
-    }
-
-    const saldo = obterSaldoMembro(guildId, userId);
-    const totalDebito = calcularTotalDebitoSaldo(saldo);
-    if (totalDebito > 0) {
-        return interaction.reply({
-            content: `❌ Você possui débitos pendentes de **${formatarPrata(totalDebito)}**. Regularize com a tesouraria antes de solicitar resgate.`,
-            ephemeral: true
-        });
-    }
-
-    const disponiveis = saldo.lancamentos.filter(item => item.status === 'disponivel' && item.valor > 0);
-    if (disponiveis.length === 0) {
-        return interaction.update({ embeds: [gerarEmbedSaldo(guildId, userId)], components: gerarComponentesSaldo(guildId, userId) });
-    }
-    await interaction.deferUpdate();
-
-    const resgateId = Date.now().toString();
-    const valorTotal = disponiveis.reduce((acc, item) => acc + item.valor, 0);
-    disponiveis.forEach(item => {
-        item.status = 'solicitado';
-        item.solicitadoEmMs = Date.now();
-        item.resgateId = resgateId;
-    });
-    saldo.resgates.push({
-        id: resgateId,
-        valorTotal,
-        status: 'solicitado',
-        solicitadoEmMs: Date.now(),
-        pagoEmMs: null,
-        pagoPorId: null,
-        lancamentoIds: disponiveis.map(item => item.id)
-    });
-    salvarDados();
-
-    const embedPedido = new EmbedBuilder()
-        .setTitle('💸 Solicitação de resgate')
-        .setColor('#f1c40f')
-        .setDescription(`<@${userId}> solicitou resgate de **${formatarPrata(valorTotal)}**.`)
-        .addFields({ name: 'Itens incluídos', value: dividirTextoDiscord(disponiveis.map(item => `• ${item.descricao}: **${formatarPrata(item.valor)}**`).join('\n'), 1024)[0] })
-        .setFooter({ text: `Resgate ID: ${resgateId}` });
-    const componentes = [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`saldo_pagar_${guildId}_${userId}_${resgateId}`).setLabel('Marcar como Pago').setEmoji('✅').setStyle(ButtonStyle.Success))];
-
-    if (interaction.channel?.send) {
-        await interaction.channel.send({
-            content: `<@&${configGuild.cargoLeilaoId}> novo resgate solicitado por <@${userId}>.`,
-            embeds: [embedPedido],
-            components: componentes,
-            allowedMentions: { roles: [configGuild.cargoLeilaoId], users: [userId] }
-        }).catch(() => null);
-    }
-
-    const dmsEnviadas = await enviarDmResponsaveisLeilao(guild, configGuild, { embeds: [embedPedido], components: componentes });
-    await enviarDmUsuario(userId, { embeds: [new EmbedBuilder().setTitle('✅ Resgate solicitado').setColor('#2ecc71').setDescription(`Seu pedido de **${formatarPrata(valorTotal)}** foi enviado para o cargo responsável.`)] });
-
-    return interaction.editReply({
-        content: `✅ Resgate solicitado. DMs enviadas aos responsáveis: **${dmsEnviadas}**.`,
-        embeds: [gerarEmbedSaldo(guildId, userId)],
-        components: gerarComponentesSaldo(guildId, userId)
-    });
-}
-
-async function marcarResgateComoPago(interaction, guildId, userId, resgateId) {
-    const guild = interaction.guild || client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
-    const podeOperar = await usuarioPodeOperarLeilao(interaction, guildId);
-    if (!podeOperar) return interaction.reply({ content: '❌ Apenas o cargo responsável por leilões/resgates pode marcar este resgate como pago.', ephemeral: true });
-
-    const saldo = obterSaldoMembro(guildId, userId);
-    const resgate = saldo.resgates.find(item => item.id === resgateId);
-    if (!resgate) return interaction.reply({ content: '❌ Resgate não encontrado.', ephemeral: true });
-    if (resgate.status === 'pago') return interaction.reply({ content: '✅ Este resgate já estava marcado como pago.', ephemeral: true });
-    await interaction.deferUpdate();
-
-    resgate.status = 'pago';
-    resgate.pagoEmMs = Date.now();
-    resgate.pagoPorId = interaction.user.id;
-
-    const eventosParaAtualizar = new Set();
-    saldo.lancamentos.forEach(lancamento => {
-        if (lancamento.resgateId !== resgateId) return;
-        lancamento.status = 'pago';
-        lancamento.pagoEmMs = Date.now();
-        lancamento.pagoPorId = interaction.user.id;
-        if (lancamento.tipo === 'sacolas' && lancamento.eventoId) {
-            const evento = eventosAtivos.get(lancamento.eventoId);
-            const grupo = evento?.grupos?.[normalizarIndexGrupo(lancamento.grupoIndex)];
-            const resultado = grupo?.splitSacolas?.resultados?.find(item => item.userId === userId);
-            if (resultado) {
-                resultado.pago = true;
-                resultado.pagoEmMs = Date.now();
-                resultado.pagoPorId = interaction.user.id;
-                eventosParaAtualizar.add(`${lancamento.eventoId}_${normalizarIndexGrupo(lancamento.grupoIndex)}`);
-            }
-        }
-    });
-
-    salvarDados();
-    for (const chave of eventosParaAtualizar) {
-        const [eventoId, grupoIndex] = chave.split('_');
-        const evento = eventosAtivos.get(eventoId);
-        if (evento && guild) await atualizarRegistroEvento(guild, evento, grupoIndex);
-    }
-
-    await enviarDmUsuario(userId, { embeds: [new EmbedBuilder().setTitle('✅ Resgate pago').setColor('#2ecc71').setDescription(`Seu resgate de **${formatarPrata(resgate.valorTotal)}** foi marcado como pago por <@${interaction.user.id}>.`)] });
-    const resposta = { content: `✅ Resgate de <@${userId}> marcado como pago: **${formatarPrata(resgate.valorTotal)}**.`, components: [] };
-    return interaction.editReply(resposta);
-}
-
-async function processarComandoSaldoGerenciar(interaction) {
-    const guildId = interaction.guild.id;
-    const podeGerenciar = await usuarioPodeGerenciarSaldo(interaction, guildId);
-    if (!podeGerenciar) {
-        return interaction.reply({
-            content: '❌ Apenas administradores ou o cargo responsável por leilões/resgates (configurado em /configuracoes) pode gerenciar saldos.',
-            ephemeral: true
-        });
-    }
-
-    const subcomando = interaction.options.getSubcommand();
-    const motivoPadrao = (texto, fallback) => limitarTexto(texto || fallback, 120);
-
-    if (subcomando === 'consultar') {
-        const membro = interaction.options.getUser('membro');
-        return interaction.reply({
-            embeds: [gerarEmbedSaldo(guildId, membro.id, { consultaAdmin: true })],
-            components: gerarComponentesSaldo(guildId, membro.id, interaction.user.id),
-            ephemeral: true
-        });
-    }
-
-    const valor = interaction.options.getInteger('valor');
-    const operadorId = interaction.user.id;
-
-    if (subcomando === 'adicionar') {
-        const membro = interaction.options.getUser('membro');
-        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Crédito manual por <@${operadorId}>`);
-        const resultado = registrarLancamentoManual(guildId, membro.id, {
-            tipo: 'ajuste',
-            descricao: motivo,
-            valor,
-            status: 'disponivel'
-        }, operadorId);
-
-        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
-
-        await enviarDmUsuario(membro.id, {
-            embeds: [new EmbedBuilder()
-                .setTitle('💰 Crédito adicionado ao seu saldo')
-                .setColor('#2ecc71')
-                .setDescription(`**${formatarPrata(valor)}** foram adicionados ao seu saldo.\n**Motivo:** ${motivo}\n**Por:** <@${operadorId}>`)]
-        });
-
-        const saldoAtual = calcularTotalDisponivelSaldo(obterSaldoMembro(guildId, membro.id));
-        return interaction.reply({
-            content: `✅ **${formatarPrata(valor)}** adicionados ao saldo de <@${membro.id}>.\nSaldo disponível atual: **${formatarPrata(saldoAtual)}**.`,
-            ephemeral: true
-        });
-    }
-
-    if (subcomando === 'remover') {
-        const membro = interaction.options.getUser('membro');
-        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Remoção manual por <@${operadorId}>`);
-        const resultado = removerCreditoSaldo(guildId, membro.id, valor, operadorId, motivo);
-        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
-
-        await enviarDmUsuario(membro.id, {
-            embeds: [new EmbedBuilder()
-                .setTitle('📉 Crédito removido do seu saldo')
-                .setColor('#e67e22')
-                .setDescription(`**${formatarPrata(valor)}** foram removidos do seu saldo.\n**Motivo:** ${motivo}\n**Por:** <@${operadorId}>`)]
-        });
-
-        return interaction.reply({
-            content: `✅ **${formatarPrata(valor)}** removidos do saldo de <@${membro.id}>.\nSaldo disponível restante: **${formatarPrata(resultado.saldoRestante)}**.`,
-            ephemeral: true
-        });
-    }
-
-    if (subcomando === 'transferir') {
-        const origem = interaction.options.getUser('origem');
-        const destino = interaction.options.getUser('destino');
-        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Transferência por <@${operadorId}>`);
-        const resultado = transferirSaldoEntreMembros(guildId, origem.id, destino.id, valor, operadorId, motivo);
-        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
-
-        const saldoOrigem = calcularTotalDisponivelSaldo(obterSaldoMembro(guildId, origem.id));
-        const saldoDestino = calcularTotalDisponivelSaldo(obterSaldoMembro(guildId, destino.id));
-
-        await enviarDmUsuario(origem.id, {
-            embeds: [new EmbedBuilder()
-                .setTitle('🔁 Transferência enviada')
-                .setColor('#3498db')
-                .setDescription(`Você transferiu **${formatarPrata(valor)}** para <@${destino.id}>.\n**Motivo:** ${motivo}\n**Saldo restante:** ${formatarPrata(saldoOrigem)}`)]
-        });
-        await enviarDmUsuario(destino.id, {
-            embeds: [new EmbedBuilder()
-                .setTitle('🔁 Transferência recebida')
-                .setColor('#2ecc71')
-                .setDescription(`Você recebeu **${formatarPrata(valor)}** de <@${origem.id}>.\n**Motivo:** ${motivo}\n**Saldo disponível:** ${formatarPrata(saldoDestino)}`)]
-        });
-
-        return interaction.reply({
-            content: `✅ **${formatarPrata(valor)}** transferidos de <@${origem.id}> para <@${destino.id}>.\nOrigem: **${formatarPrata(saldoOrigem)}** | Destino: **${formatarPrata(saldoDestino)}**.`,
-            ephemeral: true
-        });
-    }
-
-    if (subcomando === 'pendencia') {
-        const membro = interaction.options.getUser('membro');
-        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Pendência registrada por <@${operadorId}>`);
-        const resultado = registrarLancamentoManual(guildId, membro.id, {
-            tipo: 'debito',
-            descricao: motivo,
-            valor,
-            status: 'debito'
-        }, operadorId);
-        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
-
-        const debitoTotal = calcularTotalDebitoSaldo(obterSaldoMembro(guildId, membro.id));
-        await enviarDmUsuario(membro.id, {
-            embeds: [new EmbedBuilder()
-                .setTitle('🔴 Pendência registrada')
-                .setColor('#e74c3c')
-                .setDescription(`Foi registrado um débito de **${formatarPrata(valor)}** em seu saldo.\n**Motivo:** ${motivo}\n**Total de débitos:** ${formatarPrata(debitoTotal)}`)]
-        });
-
-        return interaction.reply({
-            content: `✅ Débito de **${formatarPrata(valor)}** registrado para <@${membro.id}>.\nTotal de pendências: **${formatarPrata(debitoTotal)}**.`,
-            ephemeral: true
-        });
-    }
-
-    if (subcomando === 'quitar-pendencia') {
-        const membro = interaction.options.getUser('membro');
-        const motivo = motivoPadrao(interaction.options.getString('motivo'), `Quitação de pendência por <@${operadorId}>`);
-        const resultado = quitarDebitoSaldo(guildId, membro.id, valor, operadorId, motivo);
-        if (!resultado.ok) return interaction.reply({ content: `❌ ${resultado.erro}`, ephemeral: true });
-
-        await enviarDmUsuario(membro.id, {
-            embeds: [new EmbedBuilder()
-                .setTitle('✅ Pendência quitada')
-                .setColor('#2ecc71')
-                .setDescription(`**${formatarPrata(valor)}** de débito foram quitados.\n**Motivo:** ${motivo}\n**Débito restante:** ${formatarPrata(resultado.debitoRestante)}`)]
-        });
-
-        return interaction.reply({
-            content: `✅ **${formatarPrata(valor)}** de pendência quitados para <@${membro.id}>.\nDébito restante: **${formatarPrata(resultado.debitoRestante)}**.`,
-            ephemeral: true
-        });
-    }
-
-    return interaction.reply({ content: '❌ Subcomando não reconhecido.', ephemeral: true });
 }
 
 function gerarMenuRoles(idEvento, indexGrupo) {
@@ -2303,63 +1894,19 @@ const comandoConfiguracoes = new SlashCommandBuilder()
     .addRoleOption(opt => opt.setName('cargo_evento').setDescription('Cargo permitido').setRequired(true))
     .addChannelOption(opt => opt.setName('categoria_registros').setDescription('Categoria onde os relatórios finais temporários serão guardados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
     .addChannelOption(opt => opt.setName('categoria_leiloes').setDescription('Categoria onde os canais temporários de leilão serão criados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
-    .addRoleOption(opt => opt.setName('cargo_leiloes').setDescription('Cargo responsável por vendas, leilões, resgates e gestão de saldos').setRequired(false))
+    .addRoleOption(opt => opt.setName('cargo_leiloes').setDescription('Cargo responsável por vendas e leilões').setRequired(false))
+    .addChannelOption(opt => opt.setName('canal_recibos_integracao').setDescription('Canal onde recibos JSON serão publicados para leitura por outro bot').addChannelTypes(ChannelType.GuildText).setRequired(false))
+    .addChannelOption(opt => opt.setName('canal_taxas_guilda').setDescription('Canal de registro das taxas da guilda (saldo acumulado em JSON)').addChannelTypes(ChannelType.GuildText).setRequired(false))
     .addChannelOption(opt => opt.setName('canal_forum_builds').setDescription('Canal fórum das builds (Conteúdo - 01, Baú Dourado - 01...)').addChannelTypes(ChannelType.GuildForum).setRequired(false));
 
 const comandoRanking = new SlashCommandBuilder()
     .setName('ranking')
     .setDescription('Mostra o Top 10 membros com mais XP de atividade no mês');
 
-const comandoSaldo = new SlashCommandBuilder()
-    .setName('saldo')
-    .setDescription('Consulta splits, leilões pendentes e saldo disponível para resgate')
-    .addUserOption(opt => opt.setName('membro').setDescription('Consultar saldo de outro membro (cargo responsável)').setRequired(false));
-
-const comandoSaldoGerenciar = new SlashCommandBuilder()
-    .setName('saldo-gerenciar')
-    .setDescription('Gerencia saldos de membros (cargo de leilões/resgates ou admin)')
-    .addSubcommand(sub => sub
-        .setName('adicionar')
-        .setDescription('Adiciona crédito ao saldo de um membro')
-        .addUserOption(opt => opt.setName('membro').setDescription('Membro que receberá o crédito').setRequired(true))
-        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
-        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo do ajuste').setRequired(false)))
-    .addSubcommand(sub => sub
-        .setName('remover')
-        .setDescription('Remove crédito disponível do saldo de um membro')
-        .addUserOption(opt => opt.setName('membro').setDescription('Membro que terá o crédito removido').setRequired(true))
-        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
-        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo do ajuste').setRequired(false)))
-    .addSubcommand(sub => sub
-        .setName('transferir')
-        .setDescription('Transfere crédito disponível entre dois membros')
-        .addUserOption(opt => opt.setName('origem').setDescription('Membro de origem').setRequired(true))
-        .addUserOption(opt => opt.setName('destino').setDescription('Membro de destino').setRequired(true))
-        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
-        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo da transferência').setRequired(false)))
-    .addSubcommand(sub => sub
-        .setName('pendencia')
-        .setDescription('Registra um débito/pendência para um membro')
-        .addUserOption(opt => opt.setName('membro').setDescription('Membro que receberá o débito').setRequired(true))
-        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
-        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo da pendência').setRequired(false)))
-    .addSubcommand(sub => sub
-        .setName('quitar-pendencia')
-        .setDescription('Quita parte ou total de débitos pendentes de um membro')
-        .addUserOption(opt => opt.setName('membro').setDescription('Membro que terá o débito quitado').setRequired(true))
-        .addIntegerOption(opt => opt.setName('valor').setDescription('Valor em Pratas').setRequired(true).setMinValue(1))
-        .addStringOption(opt => opt.setName('motivo').setDescription('Motivo da quitação').setRequired(false)))
-    .addSubcommand(sub => sub
-        .setName('consultar')
-        .setDescription('Consulta o saldo detalhado de um membro')
-        .addUserOption(opt => opt.setName('membro').setDescription('Membro a consultar').setRequired(true)));
-
 const COMANDOS_SLASH_JSON = [
     comandoEvento.toJSON(),
     comandoConfiguracoes.toJSON(),
-    comandoRanking.toJSON(),
-    comandoSaldo.toJSON(),
-    comandoSaldoGerenciar.toJSON()
+    comandoRanking.toJSON()
 ];
 
 async function registrarComandosSlash(rest, guildIds = []) {
@@ -2493,39 +2040,6 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embedRank] });
     }
 
-    // COMANDO /SALDO
-    if (interaction.isChatInputCommand() && interaction.commandName === 'saldo') {
-        const guildId = interaction.guild.id;
-        const membroAlvo = interaction.options.getUser('membro');
-        const userId = membroAlvo?.id || interaction.user.id;
-
-        if (membroAlvo && membroAlvo.id !== interaction.user.id) {
-            const podeConsultar = await usuarioPodeGerenciarSaldo(interaction, guildId);
-            if (!podeConsultar) {
-                return interaction.reply({
-                    content: '❌ Apenas administradores ou o cargo responsável por leilões/resgates pode consultar o saldo de outros membros.',
-                    ephemeral: true
-                });
-            }
-            return interaction.reply({
-                embeds: [gerarEmbedSaldo(guildId, userId, { consultaAdmin: true })],
-                components: gerarComponentesSaldo(guildId, userId, interaction.user.id),
-                ephemeral: true
-            });
-        }
-
-        return interaction.reply({
-            embeds: [gerarEmbedSaldo(guildId, userId)],
-            components: gerarComponentesSaldo(guildId, userId, interaction.user.id),
-            ephemeral: true
-        });
-    }
-
-    // COMANDO /SALDO-GERENCIAR
-    if (interaction.isChatInputCommand() && interaction.commandName === 'saldo-gerenciar') {
-        return processarComandoSaldoGerenciar(interaction);
-    }
-
     // COMANDO /CONFIGURACOES
     if (interaction.isChatInputCommand() && interaction.commandName === 'configuracoes') {
         const categoria = interaction.options.getChannel('categoria_canais');
@@ -2533,6 +2047,8 @@ client.on('interactionCreate', async interaction => {
         const categoriaRegistros = interaction.options.getChannel('categoria_registros');
         const categoriaLeiloes = interaction.options.getChannel('categoria_leiloes');
         const cargoLeiloes = interaction.options.getRole('cargo_leiloes');
+        const canalRecibosIntegracao = interaction.options.getChannel('canal_recibos_integracao');
+        const canalTaxasGuilda = interaction.options.getChannel('canal_taxas_guilda');
         const canalForumBuilds = interaction.options.getChannel('canal_forum_builds');
         const configAtual = configuracoesPorGuild.get(interaction.guild.id) || {};
         configuracoesPorGuild.set(interaction.guild.id, {
@@ -2541,6 +2057,8 @@ client.on('interactionCreate', async interaction => {
             categoriaRegistrosId: categoriaRegistros?.id || configAtual.categoriaRegistrosId || null,
             categoriaLeiloesId: categoriaLeiloes?.id || configAtual.categoriaLeiloesId || null,
             cargoLeilaoId: cargoLeiloes?.id || configAtual.cargoLeilaoId || null,
+            canalRecibosIntegracaoId: canalRecibosIntegracao?.id || configAtual.canalRecibosIntegracaoId || null,
+            canalTaxasGuildaId: canalTaxasGuilda?.id || configAtual.canalTaxasGuildaId || null,
             canalForumBuildsId: canalForumBuilds?.id || configAtual.canalForumBuildsId || null,
             atualizadoPorId: interaction.user.id
         });
@@ -2555,9 +2073,15 @@ client.on('interactionCreate', async interaction => {
             ? `\n🏷️ Categoria de leilões: <#${categoriaLeiloes.id}>`
             : (configAtual.categoriaLeiloesId ? `\n🏷️ Categoria de leilões mantida: <#${configAtual.categoriaLeiloesId}>` : '\n🏷️ Categoria de leilões: não configurada');
         const textoCargoLeiloes = cargoLeiloes
-            ? `\n🧾 Cargo responsável por leilões/resgates: <@&${cargoLeiloes.id}>`
-            : (configAtual.cargoLeilaoId ? `\n🧾 Cargo responsável por leilões/resgates mantido: <@&${configAtual.cargoLeilaoId}>` : '\n🧾 Cargo responsável por leilões/resgates: não configurado');
-        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoLeiloes}${textoCargoLeiloes}${textoForum}`, ephemeral: true });
+            ? `\n🧾 Cargo responsável por leilões: <@&${cargoLeiloes.id}>`
+            : (configAtual.cargoLeilaoId ? `\n🧾 Cargo responsável por leilões mantido: <@&${configAtual.cargoLeilaoId}>` : '\n🧾 Cargo responsável por leilões: não configurado');
+        const textoRecibosIntegracao = canalRecibosIntegracao
+            ? `\n🤖 Canal de recibos (integração): <#${canalRecibosIntegracao.id}>`
+            : (configAtual.canalRecibosIntegracaoId ? `\n🤖 Canal de recibos (integração) mantido: <#${configAtual.canalRecibosIntegracaoId}>` : '\n🤖 Canal de recibos (integração): não configurado');
+        const textoTaxasGuilda = canalTaxasGuilda
+            ? `\n🏛️ Canal de taxas da guilda: <#${canalTaxasGuilda.id}>`
+            : (configAtual.canalTaxasGuildaId ? `\n🏛️ Canal de taxas da guilda mantido: <#${configAtual.canalTaxasGuildaId}>` : '\n🏛️ Canal de taxas da guilda: não configurado');
+        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoLeiloes}${textoCargoLeiloes}${textoRecibosIntegracao}${textoTaxasGuilda}${textoForum}`, ephemeral: true });
     }
 
     // COMANDO /EVENTO
@@ -2807,17 +2331,42 @@ client.on('interactionCreate', async interaction => {
                 ephemeral: true
             });
         }
+        if (obterSacolaTotal(grupo) <= 0) {
+            return interaction.reply({ content: '❌ Informe o valor das sacolas antes de finalizar o split.', ephemeral: true });
+        }
+
+        return interaction.showModal(criarModalCalcSplitSacolas(idEvento, indexGrupo, grupo));
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_calc_split_')) {
+        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Apenas o Líder.', ephemeral: true });
+        const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
+        if (!grupo || grupo.fechado) return interaction.reply({ content: '❌ Este split já foi fechado.', ephemeral: true });
+
+        const taxaGuildaPercent = parsePercentualDesconto(interaction.fields.getTextInputValue('taxa_guilda'), 0);
+        const totalSacolasBruto = obterSacolaTotal(grupo);
+        const taxaGuildaValor = calcularTaxaGuilda(totalSacolasBruto, taxaGuildaPercent);
+        const totalParaSplit = Math.max(0, totalSacolasBruto - taxaGuildaValor);
+        if (totalParaSplit <= 0) {
+            return interaction.reply({ content: '❌ A taxa da guilda consome todo o valor das sacolas. Ajuste a taxa ou o total informado.', ephemeral: true });
+        }
+
+        const totalMsGeral = grupo.participantes.reduce((acc, p) => acc + p.totalMs, 0);
+        if (totalMsGeral === 0) {
+            return interaction.reply({ content: '❌ Tempo zerado para calcular o split.', ephemeral: true });
+        }
 
         const duracaoTotalTexto = formatarDuracaoMs(tempoConteudoAtual(grupo));
-        await interaction.reply({ content: '⏳ Processando o split de sacolas, adicionando XP e enviando os recibos na DM...', ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
         const falhasDmParticipantes = [];
-        const totalSacolas = obterSacolaTotal(grupo);
 
         const resultadosSplit = await Promise.all(grupo.participantes.map(async (p) => {
             const fraction = p.totalMs / totalMsGeral;
-            const ganho = Math.floor(totalSacolas * fraction);
+            const ganho = Math.floor(totalParaSplit * fraction);
 
-            // CÁLCULO DE XP (50 XP por hora)
             const horasJogadas = p.totalMs / (1000 * 60 * 60);
             const xpGanho = horasJogadas * 50;
 
@@ -2836,8 +2385,11 @@ client.on('interactionCreate', async interaction => {
                     { name: '⌛ Seu Tempo Ativo', value: formatarDuracaoMs(p.totalMs), inline: true },
                     { name: '⚡ XP Adquirido', value: `**+${Math.floor(xpGanho)} XP**`, inline: true },
                     { name: '💎 Sacolas a Receber', value: `**${formatarPrata(ganho)}**`, inline: false }
-                )
-                .setFooter({ text: 'Use o comando /ranking no servidor para ver o Placar do Mês!' });
+                );
+            if (taxaGuildaValor > 0) {
+                dmEmbed.addFields({ name: '🏛️ Taxa da guilda', value: `**${formatarPercentual(taxaGuildaPercent)}** (${formatarPrata(taxaGuildaValor)} retidos do total)`, inline: false });
+            }
+            dmEmbed.setFooter({ text: 'Use o comando /ranking no servidor para ver o Placar do Mês!' });
 
             const dmEnviada = await enviarDmUsuario(p.id, { embeds: [dmEmbed] });
             if (!dmEnviada) falhasDmParticipantes.push(p.id);
@@ -2856,21 +2408,24 @@ client.on('interactionCreate', async interaction => {
         grupo.fechado = true;
         grupo.fechadoEmMs = Date.now();
         grupo.splitSacolas = {
-            totalSacolas,
+            totalSacolas: totalSacolasBruto,
+            totalParaSplit,
+            taxaGuildaPercent,
+            taxaGuildaValor,
             totalMs: totalMsGeral,
             calculadoEmMs: Date.now(),
             calculadoPorId: interaction.user.id,
             falhasDmParticipantes,
             resultados: resultadosSplit
         };
-        resultadosSplit.forEach(resultado => registrarSplitSacolaNoSaldo(evento, indexGrupo, resultado));
         grupo.bau = normalizarBauPersistido(grupo.bau);
         salvarDados();
 
         const embedSplit = gerarEmbedRegistroEvento(evento, indexGrupo);
-
         const dmLiderEnviada = await enviarDmUsuario(evento.lider, { embeds: [embedSplit] });
         const configGuild = configuracoesPorGuild.get(interaction.guild.id);
+        const reciboIntegracao = await publicarReciboCanalIntegracao(interaction.guild, configGuild, evento, indexGrupo, 'split_sacolas');
+        const taxaGuilda = await registrarEPublicarTaxaGuilda(interaction.guild, configGuild, evento, indexGrupo, 'sacolas', totalSacolasBruto, taxaGuildaPercent);
         const registroSplit = await criarCanalRegistroSplit(interaction.guild, evento, indexGrupo, embedSplit, configGuild).catch(error => {
             console.error('Erro ao criar canal de registro do split:', error);
             return { criado: false, motivo: 'erro_ao_criar' };
@@ -2890,9 +2445,11 @@ client.on('interactionCreate', async interaction => {
         salvarDados();
 
         await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
-        await interaction.followUp({
-            content: `✅ Split de sacolas concluído. DM do líder: **${dmLiderEnviada ? 'enviada' : 'não entregue'}**. DMs dos participantes com falha: **${falhasDmParticipantes.length}**. Registro: **${registroSplit.criado ? `criado em <#${registroSplit.canalId}>` : 'não criado'}**.\n📦 Agora use **Gerenciar Baú** no relatório para informar print, valor bruto e reparo.`,
-            ephemeral: true
+        const textoTaxaGuilda = taxaGuildaValor > 0
+            ? ` Taxa guilda: **${formatarPrata(taxaGuildaValor)}** (${taxaGuilda.registrado ? `registrada em <#${taxaGuilda.channelId}>` : 'canal de taxas não configurado'}).`
+            : '';
+        return interaction.editReply({
+            content: `✅ Split de sacolas concluído. DM do líder: **${dmLiderEnviada ? 'enviada' : 'não entregue'}**. DMs dos participantes com falha: **${falhasDmParticipantes.length}**. Registro: **${registroSplit.criado ? `criado em <#${registroSplit.canalId}>` : 'não criado'}**. Recibo integração: **${reciboIntegracao.publicado ? `enviado em <#${reciboIntegracao.channelId}>` : 'não enviado'}**.${textoTaxaGuilda}\n📦 Agora use **Gerenciar Baú** no relatório para informar print, valor bruto e reparo.`
         });
     }
 
@@ -2916,9 +2473,10 @@ client.on('interactionCreate', async interaction => {
         resultado.pago = true;
         resultado.pagoEmMs = Date.now();
         resultado.pagoPorId = interaction.user.id;
-        marcarSacolaPagaNoSaldo(evento, indexGrupo, userId, interaction.user.id);
         salvarDados();
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        const configGuild = configuracoesPorGuild.get(interaction.guild.id);
+        await publicarReciboCanalIntegracao(interaction.guild, configGuild, evento, indexGrupo, 'pagamento_sacola');
         return interaction.update(gerarPainelPagamentosGrupo(evento, indexGrupo));
     }
 
@@ -2934,11 +2492,12 @@ client.on('interactionCreate', async interaction => {
                 resultado.pago = true;
                 resultado.pagoEmMs = Date.now();
                 resultado.pagoPorId = interaction.user.id;
-                marcarSacolaPagaNoSaldo(evento, indexGrupo, resultado.userId, interaction.user.id);
             }
         });
         salvarDados();
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        const configGuild = configuracoesPorGuild.get(interaction.guild.id);
+        await publicarReciboCanalIntegracao(interaction.guild, configGuild, evento, indexGrupo, 'pagamento_sacola');
         return interaction.update(gerarPainelPagamentosGrupo(evento, indexGrupo));
     }
 
@@ -2957,7 +2516,7 @@ client.on('interactionCreate', async interaction => {
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
         const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
-        return interaction.showModal(criarModalBau(idEvento, indexGrupo, obterPrintUrlsBau(grupo?.bau).join('\n')));
+        return interaction.showModal(criarModalBau(idEvento, indexGrupo, obterPrintUrlsBau(grupo?.bau).join('\n'), grupo?.bau));
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_ultimo_')) {
@@ -2975,7 +2534,7 @@ client.on('interactionCreate', async interaction => {
             await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
             return interaction.update(gerarPainelBauGrupo(evento, indexGrupo));
         }
-        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrls.join('\n')));
+        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrls.join('\n'), grupo?.bau));
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_coletar_')) {
@@ -2993,7 +2552,7 @@ client.on('interactionCreate', async interaction => {
             await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
             return interaction.update(gerarPainelBauGrupo(evento, indexGrupo));
         }
-        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrls.join('\n')));
+        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrls.join('\n'), grupo?.bau));
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_sem_')) {
@@ -3021,7 +2580,7 @@ client.on('interactionCreate', async interaction => {
         const printUrls = normalizarPrintUrls(printTexto);
         if (printTexto && printUrls.length === 0) return interaction.reply({ content: '❌ Nenhum link de imagem válido foi encontrado no campo de prints.', ephemeral: true });
         const localLoot = limitarTexto(String(interaction.fields.getTextInputValue('bau_local') || '').trim(), 80);
-        const descontoPercentual = parsePercentualDesconto(interaction.fields.getTextInputValue('bau_desconto'), 20);
+        const { descontoPercentual, taxaGuildaPercentual } = parseDescontoETaxaGuilda(interaction.fields.getTextInputValue('bau_desconto'), 20, 0);
         grupo.bau = {
             ...criarEstadoBauPadrao(),
             status: 'aguardando_decisao',
@@ -3029,6 +2588,7 @@ client.on('interactionCreate', async interaction => {
             printUrls,
             localLoot,
             descontoPercentual,
+            taxaGuildaPercentual,
             valorBruto,
             valorReparo,
             valorLiquido: Math.max(0, valorBruto - valorReparo),
@@ -3064,15 +2624,22 @@ client.on('interactionCreate', async interaction => {
         const valorPago = parseValorPrata(interaction.fields.getTextInputValue('bau_valor_pago'));
         if (valorPago <= 0) return interaction.reply({ content: '❌ Informe um valor pago maior que zero.', ephemeral: true });
 
-        const splitFinal = calcularSplitValorPorTempo(grupo, valorPago);
+        const taxaGuildaPercentual = grupo.bau.taxaGuildaPercentual || 0;
+        const taxaGuildaValor = calcularTaxaGuilda(valorPago, taxaGuildaPercentual);
+        const valorParaSplit = Math.max(0, valorPago - taxaGuildaValor);
+        if (valorParaSplit <= 0) {
+            return interaction.reply({ content: '❌ A taxa da guilda consome todo o valor pago do baú. Ajuste a taxa ou o valor informado.', ephemeral: true });
+        }
+
+        const splitFinal = calcularSplitValorPorTempo(grupo, valorParaSplit);
         grupo.bau.status = 'comprado_interno';
         grupo.bau.decisao = 'buyout';
         grupo.bau.compradorId = compradorId;
         grupo.bau.valorPago = valorPago;
+        grupo.bau.taxaGuildaValor = taxaGuildaValor;
         grupo.bau.splitFinal = splitFinal;
         grupo.bau.encerradoEmMs = Date.now();
         grupo.bau.encerradoPorId = interaction.user.id;
-        splitFinal.resultados.forEach(resultado => registrarSplitBauNoSaldo(evento, indexGrupo, resultado, 'Baú compra interna'));
         salvarDados();
 
         for (const resultado of splitFinal.resultados) {
@@ -3088,8 +2655,12 @@ client.on('interactionCreate', async interaction => {
         }
 
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        const configGuildBuyout = configuracoesPorGuild.get(interaction.guild.id);
+        await publicarReciboCanalIntegracao(interaction.guild, configGuildBuyout, evento, indexGrupo, 'split_bau');
+        await registrarEPublicarTaxaGuilda(interaction.guild, configGuildBuyout, evento, indexGrupo, 'bau', valorPago, taxaGuildaPercentual);
         await interaction.channel.send({ embeds: gerarEmbedsRegistroEvento(evento, indexGrupo) }).catch(() => null);
-        return interaction.reply({ content: `✅ Compra interna registrada. O baú foi splitado em **${formatarPrata(valorPago)}**.`, ephemeral: true });
+        const textoTaxa = taxaGuildaValor > 0 ? ` Taxa da guilda retida: **${formatarPrata(taxaGuildaValor)}**.` : '';
+        return interaction.reply({ content: `✅ Compra interna registrada. O baú foi splitado em **${formatarPrata(valorParaSplit)}**.${textoTaxa}`, ephemeral: true });
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_leilao_')) {
@@ -3326,15 +2897,22 @@ client.on('interactionCreate', async interaction => {
         if (grupo?.bau?.status !== STATUS_LEILAO_ABERTO || !leilao) return interaction.reply({ content: '❌ Este leilão não está ativo.', ephemeral: true });
         if (!leilao.maiorLance || !leilao.maiorLicitanteId) return interaction.reply({ content: '❌ Ainda não há lance para encerrar este leilão.', ephemeral: true });
 
-        const splitFinal = calcularSplitValorPorTempo(grupo, leilao.maiorLance);
+        const taxaGuildaPercentual = grupo.bau.taxaGuildaPercentual || 0;
+        const taxaGuildaValor = calcularTaxaGuilda(leilao.maiorLance, taxaGuildaPercentual);
+        const valorParaSplit = Math.max(0, leilao.maiorLance - taxaGuildaValor);
+        if (valorParaSplit <= 0) {
+            return interaction.reply({ content: '❌ A taxa da guilda consome todo o valor do leilão. Ajuste a taxa antes de encerrar.', ephemeral: true });
+        }
+
+        const splitFinal = calcularSplitValorPorTempo(grupo, valorParaSplit);
         grupo.bau.status = STATUS_LEILAO_VENDIDO;
         grupo.bau.decisao = 'leilao';
         grupo.bau.compradorId = leilao.maiorLicitanteId;
         grupo.bau.valorPago = leilao.maiorLance;
+        grupo.bau.taxaGuildaValor = taxaGuildaValor;
         grupo.bau.splitFinal = splitFinal;
         grupo.bau.encerradoEmMs = Date.now();
         grupo.bau.encerradoPorId = interaction.user.id;
-        splitFinal.resultados.forEach(resultado => registrarSplitBauNoSaldo(evento, indexGrupo, resultado, 'Baú leiloado'));
         salvarDados();
 
         await atualizarMensagemLeilao(interaction.guild, evento, indexGrupo);
@@ -3353,21 +2931,12 @@ client.on('interactionCreate', async interaction => {
         }
 
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        const configGuildLeilao = configuracoesPorGuild.get(interaction.guild.id);
+        await publicarReciboCanalIntegracao(interaction.guild, configGuildLeilao, evento, indexGrupo, 'split_bau');
+        await registrarEPublicarTaxaGuilda(interaction.guild, configGuildLeilao, evento, indexGrupo, 'bau', leilao.maiorLance, taxaGuildaPercentual);
         await interaction.channel.send({ embeds: gerarEmbedsRegistroEvento(evento, indexGrupo) }).catch(() => null);
-        return interaction.reply({ content: `✅ Leilão encerrado por **${formatarPrata(leilao.maiorLance)}**. Registro atualizado.`, ephemeral: true });
-    }
-
-    // SALDO: SOLICITAÇÃO E PAGAMENTO DE RESGATE
-    if (interaction.isButton() && interaction.customId.startsWith('saldo_resgate_')) {
-        const resto = interaction.customId.slice('saldo_resgate_'.length);
-        const [guildId, userId] = resto.split('_');
-        return solicitarResgateSaldo(interaction, guildId, userId);
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('saldo_pagar_')) {
-        const resto = interaction.customId.slice('saldo_pagar_'.length);
-        const [guildId, userId, resgateId] = resto.split('_');
-        return marcarResgateComoPago(interaction, guildId, userId, resgateId);
+        const textoTaxa = taxaGuildaValor > 0 ? ` Taxa da guilda retida: **${formatarPrata(taxaGuildaValor)}**.` : '';
+        return interaction.reply({ content: `✅ Leilão encerrado por **${formatarPrata(leilao.maiorLance)}**. Split da PT: **${formatarPrata(valorParaSplit)}**.${textoTaxa}`, ephemeral: true });
     }
 
     // BOTÃO: SAIR DO EVENTO
