@@ -217,14 +217,53 @@ function extrairIdEvento(customId, prefixo) {
     return customId.startsWith(prefixo) ? customId.slice(prefixo.length) : null;
 }
 
+function extrairIdEventoEIndexGrupo(customId, prefixo) {
+    if (!customId?.startsWith(prefixo)) return null;
+    const resto = customId.slice(prefixo.length);
+    const sep = resto.lastIndexOf('_');
+    if (sep <= 0) return null;
+    return {
+        idEvento: resto.slice(0, sep),
+        indexGrupo: resto.slice(sep + 1)
+    };
+}
+
+function extrairIdEventoEIndexGrupoEUserId(customId, prefixo) {
+    if (!customId?.startsWith(prefixo)) return null;
+    const resto = customId.slice(prefixo.length);
+    const sepUser = resto.lastIndexOf('_');
+    if (sepUser <= 0) return null;
+    const userId = resto.slice(sepUser + 1);
+    const restoGrupo = resto.slice(0, sepUser);
+    const sepGrupo = restoGrupo.lastIndexOf('_');
+    if (sepGrupo <= 0) return null;
+    return {
+        idEvento: restoGrupo.slice(0, sepGrupo),
+        indexGrupo: restoGrupo.slice(sepGrupo + 1),
+        userId
+    };
+}
+
+function buscarEventoPorId(idEvento, guildId = null) {
+    if (!idEvento) return null;
+    for (const [, evento] of eventosAtivos) {
+        if (evento?.id === idEvento && (!guildId || evento.guildId === guildId)) return evento;
+    }
+    return null;
+}
+
 function recarregarEventoDoDisco(idEvento) {
-    if (!fs.existsSync(EVENTOS_PATH)) return null;
+    if (!idEvento || !fs.existsSync(EVENTOS_PATH)) return null;
     try {
         const dados = JSON.parse(fs.readFileSync(EVENTOS_PATH, 'utf8'));
-        const evento = dados[idEvento];
+        let evento = dados[idEvento];
+        if (!evento) {
+            const entrada = Object.entries(dados).find(([, evt]) => evt?.id === idEvento);
+            if (entrada) evento = entrada[1];
+        }
         if (!evento?.id || !Array.isArray(evento.grupos)) return null;
         evento.grupos.forEach(grupo => normalizarGrupoPersistido(grupo));
-        eventosAtivos.set(idEvento, evento);
+        eventosAtivos.set(evento.id, evento);
         return evento;
     } catch (e) {
         console.error('Erro ao recarregar evento do disco:', e);
@@ -240,10 +279,12 @@ function buscarEventoPorMensagemPrincipal(messageId, guildId) {
 }
 
 function obterEvento(idEvento, interaction = null) {
-    let evento = eventosAtivos.get(idEvento);
+    if (!idEvento) return null;
+    const guildId = interaction?.guild?.id || null;
+    let evento = eventosAtivos.get(idEvento) || buscarEventoPorId(idEvento, guildId);
     if (!evento) evento = recarregarEventoDoDisco(idEvento);
-    if (!evento && interaction?.message?.id && interaction.guild?.id) {
-        evento = buscarEventoPorMensagemPrincipal(interaction.message.id, interaction.guild.id);
+    if (!evento && interaction?.message?.id && guildId) {
+        evento = buscarEventoPorMensagemPrincipal(interaction.message.id, guildId);
     }
     return evento;
 }
@@ -1595,7 +1636,7 @@ async function enviarLeilaoParaRevisao(guild, evento, indexGrupo, motivo = 'praz
 }
 
 function gerarMenuRoles(idEvento, indexGrupo) {
-    const evento = eventosAtivos.get(idEvento); const grupo = evento?.grupos[indexGrupo]; const options = [];
+    const evento = obterEvento(idEvento); const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)]; const options = [];
     if (!evento || !grupo || grupo.fechado) {
         options.push({ label: 'Evento indisponível', value: 'UNAVAILABLE' });
         return new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`select_role_${idEvento}_${indexGrupo}`).setPlaceholder('Escolha sua função...').addOptions(options));
@@ -1609,7 +1650,7 @@ function gerarMenuRoles(idEvento, indexGrupo) {
 function gerarMenuArmas(idEvento, indexGrupo, role) {
     const idx = normalizarIndexGrupo(indexGrupo);
     const roleSlug = roleParaSlug(role);
-    const evento = eventosAtivos.get(idEvento); const grupo = evento?.grupos[idx];
+    const evento = obterEvento(idEvento); const grupo = evento?.grupos[idx];
     if (!evento || !grupo || grupo.fechado || !evento.composicao[role]) {
         return new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`select_weapon_${idEvento}_${idx}_${roleSlug}`).setPlaceholder('Escolha sua arma...').addOptions([{ label: 'Evento indisponível', value: 'UNAVAILABLE' }]));
     }
@@ -2154,9 +2195,9 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ content: `Você escolheu o **Grupo ${parseInt(interaction.values[0]) + 1}**. Classe:`, components: [gerarMenuRoles(idEvento, interaction.values[0])], ephemeral: true });
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('select_role_')) {
-        const partes = interaction.customId.split('_');
-        const idEvento = partes[2];
-        const indexGrupo = partes[3];
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'select_role_');
+        if (!parsed) return interaction.update({ content: '❌ Interação inválida.', components: [] });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!evento || !grupo || grupo.fechado) return interaction.update({ content: '❌ Este grupo não está disponível.', components: [] });
@@ -2206,7 +2247,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: INICIAR / PAUSAR / RETOMAR CONTEÚDO (LÍDER)
     if (interaction.isButton() && interaction.customId.startsWith('dash_conteudo_timer_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_conteudo_timer_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) {
@@ -2235,7 +2278,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: ABRIR PAINEL PRIVADO DO LÍDER
     if (interaction.isButton() && interaction.customId.startsWith('dash_leader_panel_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_leader_panel_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode abrir este painel.', ephemeral: true });
@@ -2244,7 +2289,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: PAUSAR MEU TEMPO
     if (interaction.isButton() && interaction.customId.startsWith('dash_pause_self_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_pause_self_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!grupo || grupo.fechado) return interaction.reply({ content: '❌ Este grupo não está disponível.', ephemeral: true });
@@ -2262,7 +2309,9 @@ client.on('interactionCreate', async interaction => {
 
     // MENU: FORÇAR PAUSE (Líder)
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('dash_force_pause_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_force_pause_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Negado.', ephemeral: true });
@@ -2283,7 +2332,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: ADICIONAR SACOLAS (MODAL)
     if (interaction.isButton() && interaction.customId.startsWith('dash_add_loot_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_add_loot_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Apenas o Líder.', ephemeral: true });
@@ -2298,7 +2349,9 @@ client.on('interactionCreate', async interaction => {
 
     // RECEBIMENTO DO MODAL DE SACOLAS
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_sacolas_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_sacolas_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!evento || !grupo || grupo.fechado) return interaction.reply({ content: '❌ Este grupo já foi fechado ou não está disponível.', ephemeral: true });
@@ -2311,7 +2364,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: CALCULAR SPLIT DE SACOLAS, DM E XP
     if (interaction.isButton() && interaction.customId.startsWith('dash_calc_split_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_calc_split_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Apenas o Líder.', ephemeral: true });
@@ -2335,11 +2390,14 @@ client.on('interactionCreate', async interaction => {
             return interaction.reply({ content: '❌ Informe o valor das sacolas antes de finalizar o split.', ephemeral: true });
         }
 
+        salvarDados();
         return interaction.showModal(criarModalCalcSplitSacolas(idEvento, indexGrupo, grupo));
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_calc_split_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_calc_split_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Apenas o Líder.', ephemeral: true });
@@ -2455,7 +2513,9 @@ client.on('interactionCreate', async interaction => {
 
     // PAINEL PÓS-FECHAMENTO: PAGAMENTOS DE SACOLAS
     if (interaction.isButton() && interaction.customId.startsWith('dash_payment_panel_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_payment_panel_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode abrir este painel.', ephemeral: true });
@@ -2463,7 +2523,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_pay_sacola_')) {
-        const [, , , idEvento, indexGrupo, userId] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupoEUserId(interaction.customId, 'dash_pay_sacola_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo, userId } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode confirmar pagamentos.', ephemeral: true });
@@ -2481,7 +2543,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_pay_all_sacola_')) {
-        const [, , , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_pay_all_sacola_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode confirmar pagamentos.', ephemeral: true });
@@ -2503,7 +2567,9 @@ client.on('interactionCreate', async interaction => {
 
     // PAINEL PÓS-FECHAMENTO: BAÚ
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_panel_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_panel_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2511,7 +2577,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_informar_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_informar_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2520,7 +2588,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_ultimo_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_ultimo_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2538,7 +2608,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_coletar_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_coletar_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2556,7 +2628,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_sem_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_sem_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2568,7 +2642,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_bau_') && !interaction.customId.startsWith('modal_bau_buyout_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_bau_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2601,7 +2677,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_buyout_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_buyout_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2611,7 +2689,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_bau_buyout_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_bau_buyout_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2664,7 +2744,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_leilao_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_leilao_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode enviar o baú para leilão.', ephemeral: true });
@@ -2731,7 +2813,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('auction_bid_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'auction_bid_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         const leilao = grupo?.bau?.leilao;
@@ -2747,7 +2831,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_auction_bid_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_auction_bid_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         const leilao = grupo?.bau?.leilao;
@@ -2788,7 +2874,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('auction_review_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'auction_review_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!evento || grupo?.bau?.status !== STATUS_LEILAO_REVISAO || !grupo.bau.leilao) return interaction.reply({ content: '❌ Este leilão não está em revisão.', ephemeral: true });
@@ -2797,7 +2885,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_auction_review_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_auction_review_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         const bau = grupo?.bau;
@@ -2849,7 +2939,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('auction_reopen_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'auction_reopen_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         const bau = grupo?.bau;
@@ -2883,7 +2975,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('auction_close_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'auction_close_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         const ehAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
@@ -2942,7 +3036,12 @@ client.on('interactionCreate', async interaction => {
     // BOTÃO: SAIR DO EVENTO
     if (interaction.isButton() && (interaction.customId.startsWith('dash_leave_') || interaction.customId.startsWith('leave_all_'))) {
         const isDash = interaction.customId.startsWith('dash_leave_');
-        const idEvento = isDash ? interaction.customId.split('_')[2] : extrairIdEvento(interaction.customId, 'leave_all_');
+        const parsed = isDash
+            ? extrairIdEventoEIndexGrupo(interaction.customId, 'dash_leave_')
+            : null;
+        const idEvento = isDash ? parsed?.idEvento : extrairIdEvento(interaction.customId, 'leave_all_');
+        const indexGrupoDash = parsed?.indexGrupo;
+        if (!idEvento) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (evento) {
@@ -2950,7 +3049,7 @@ client.on('interactionCreate', async interaction => {
                 grupo.participantes = grupo.participantes.filter(p => p.id !== interaction.user.id);
                 if (grupo.canalVozId) await interaction.guild.channels.cache.get(grupo.canalVozId)?.permissionOverwrites.delete(interaction.user.id).catch(()=>null);
                 if (grupo.canalTextoId) await interaction.guild.channels.cache.get(grupo.canalTextoId)?.permissionOverwrites.delete(interaction.user.id).catch(()=>null);
-                if (isDash && parseInt(interaction.customId.split('_')[3]) === index) await atualizarMsgDashboard(interaction.guild, evento, index);
+                if (isDash && normalizarIndexGrupo(indexGrupoDash) === index) await atualizarMsgDashboard(interaction.guild, evento, index);
             }
             await atualizarMensagemPrincipalEvento(interaction.guild, evento);
             salvarDados();
