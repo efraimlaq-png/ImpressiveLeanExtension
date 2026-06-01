@@ -16,13 +16,21 @@ const CONFIG_PATH = path.join(__dirname, 'guild-config.json');
 const XP_PATH = path.join(__dirname, 'xp-config.json');
 const REGISTROS_PATH = path.join(__dirname, 'registros-canais.json');
 const EVENTOS_PATH = path.join(__dirname, 'eventos-ativos.json');
-const SALDOS_PATH = path.join(__dirname, 'saldos-membros.json');
+const TAXAS_GUILDA_PATH = path.join(__dirname, 'taxas-guilda.json');
 const xpMembros = new Map();
 const registrosCanais = new Map();
-const saldosMembros = new Map();
+const taxasGuildaAcumulado = new Map();
+const RECIBO_TAXA_GUILDA_SCHEMA = 'flg-guild-tax/v1';
+const RECIBO_TAXA_GUILDA_MARCADOR = 'FLG_GUILD_TAX';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID || null;
+const CANAL_RECIBOS_INTEGRACAO_ID = process.env.CANAL_RECIBOS_INTEGRACAO_ID || null;
+const CANAL_RECIBOS_ID = process.env.CANAL_RECIBOS_ID || null;
+const CATEGORIA_REGISTROS_ID = process.env.CATEGORIA_REGISTROS_ID || null;
+const CANAL_TAXAS_GUILDA_ID = process.env.CANAL_TAXAS_GUILDA_ID || null;
+const COMANDO_SALDO_INTEGRACAO = (process.env.COMANDO_SALDO_INTEGRACAO || 'p!m').trim();
+const INTERVALO_COMANDOS_SALDO_MS = Math.max(300, Number(process.env.INTERVALO_COMANDOS_SALDO_MS) || 600);
 const TIME_ZONE = process.env.TIME_ZONE || 'America/Sao_Paulo';
 const MINUTOS_ABERTURA_SALA = 30;
 const MAX_OPCOES_MENU = 25;
@@ -49,7 +57,8 @@ function carregarDados() {
         try {
             const dados = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
             Object.entries(dados).forEach(([guildId, config]) => {
-                if (config?.categoriaId && config?.cargoEventoId) configuracoesPorGuild.set(guildId, config);
+                if (!config || typeof config !== 'object') return;
+                if (config.categoriaId && config.cargoEventoId) configuracoesPorGuild.set(guildId, config);
             });
         } catch (e) { console.error('Erro ao ler guild-config.json', e); }
     }
@@ -75,11 +84,13 @@ function carregarDados() {
             });
         } catch (e) { console.error('Erro ao ler eventos-ativos.json', e); }
     }
-    if (fs.existsSync(SALDOS_PATH)) {
+    if (fs.existsSync(TAXAS_GUILDA_PATH)) {
         try {
-            const dados = JSON.parse(fs.readFileSync(SALDOS_PATH, 'utf8'));
-            Object.entries(dados).forEach(([chave, saldo]) => saldosMembros.set(chave, normalizarSaldoMembro(saldo)));
-        } catch (e) { console.error('Erro ao ler saldos-membros.json', e); }
+            const dados = JSON.parse(fs.readFileSync(TAXAS_GUILDA_PATH, 'utf8'));
+            Object.entries(dados).forEach(([guildId, total]) => {
+                taxasGuildaAcumulado.set(guildId, Math.max(0, Math.floor(Number(total) || 0)));
+            });
+        } catch (e) { console.error('Erro ao ler taxas-guilda.json', e); }
     }
 }
 
@@ -97,11 +108,59 @@ function salvarDados() {
         const objetoEventos = Object.fromEntries(eventosAtivos.entries());
         fs.writeFileSync(EVENTOS_PATH, JSON.stringify(objetoEventos, null, 2), 'utf8');
 
-        const objetoSaldos = Object.fromEntries(saldosMembros.entries());
-        fs.writeFileSync(SALDOS_PATH, JSON.stringify(objetoSaldos, null, 2), 'utf8');
+        const objetoTaxasGuilda = Object.fromEntries(taxasGuildaAcumulado.entries());
+        fs.writeFileSync(TAXAS_GUILDA_PATH, JSON.stringify(objetoTaxasGuilda, null, 2), 'utf8');
+
     } catch (e) { console.error('Erro ao salvar arquivos de banco de dados locais', e); }
 }
 carregarDados();
+
+function recarregarConfigGuildDoDisco(guildId) {
+    if (!guildId || !fs.existsSync(CONFIG_PATH)) return null;
+    try {
+        const dados = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        const config = dados[guildId];
+        if (!config?.categoriaId || !config?.cargoEventoId) return null;
+        configuracoesPorGuild.set(guildId, config);
+        return config;
+    } catch (e) {
+        console.error('Erro ao recarregar guild-config.json:', e);
+        return null;
+    }
+}
+
+function obterConfigGuild(guildId) {
+    if (!guildId) return null;
+    const config = configuracoesPorGuild.get(guildId) || recarregarConfigGuildDoDisco(guildId);
+    if (!config) return null;
+    return {
+        ...config,
+        canalRecibosId: config.canalRecibosId || CANAL_RECIBOS_ID || null,
+        canalRecibosIntegracaoId: config.canalRecibosIntegracaoId || CANAL_RECIBOS_INTEGRACAO_ID || null,
+        categoriaRegistrosId: config.categoriaRegistrosId || CATEGORIA_REGISTROS_ID || null,
+        canalTaxasGuildaId: config.canalTaxasGuildaId || CANAL_TAXAS_GUILDA_ID || null
+    };
+}
+
+function textoMotivoPublicacao(resultado, rotulo) {
+    if (resultado?.publicado || resultado?.criado) {
+        const canal = resultado.channelId || resultado.canalId;
+        const comandos = resultado.comandosEnviados;
+        const detalheComandos = typeof comandos === 'number' ? ` · **${comandos}** comando(s) \`${COMANDO_SALDO_INTEGRACAO}\`` : '';
+        return `**${rotulo}:** enviado em <#${canal}>${detalheComandos}`;
+    }
+    const motivos = {
+        canal_nao_configurado: 'canal não configurado — use `/configuracoes`',
+        categoria_nao_configurada: 'categoria de registros não configurada',
+        categoria_invalida: 'categoria de registros inválida',
+        canal_invalido: 'canal inválido ou sem permissão de envio',
+        falha_ao_enviar: 'falha ao enviar (verifique permissões do bot)',
+        sem_participantes: 'nenhum participante pendente para integração de saldo',
+        erro_ao_criar: 'erro ao criar canal de registro'
+    };
+    const motivo = motivos[resultado?.motivo] || resultado?.motivo || 'não enviado';
+    return `**${rotulo}:** ${motivo}`;
+}
 
 // ==========================================
 // FUNÇÕES AUXILIARES DE CÁLCULO E TEMPO
@@ -210,14 +269,53 @@ function extrairIdEvento(customId, prefixo) {
     return customId.startsWith(prefixo) ? customId.slice(prefixo.length) : null;
 }
 
+function extrairIdEventoEIndexGrupo(customId, prefixo) {
+    if (!customId?.startsWith(prefixo)) return null;
+    const resto = customId.slice(prefixo.length);
+    const sep = resto.lastIndexOf('_');
+    if (sep <= 0) return null;
+    return {
+        idEvento: resto.slice(0, sep),
+        indexGrupo: resto.slice(sep + 1)
+    };
+}
+
+function extrairIdEventoEIndexGrupoEUserId(customId, prefixo) {
+    if (!customId?.startsWith(prefixo)) return null;
+    const resto = customId.slice(prefixo.length);
+    const sepUser = resto.lastIndexOf('_');
+    if (sepUser <= 0) return null;
+    const userId = resto.slice(sepUser + 1);
+    const restoGrupo = resto.slice(0, sepUser);
+    const sepGrupo = restoGrupo.lastIndexOf('_');
+    if (sepGrupo <= 0) return null;
+    return {
+        idEvento: restoGrupo.slice(0, sepGrupo),
+        indexGrupo: restoGrupo.slice(sepGrupo + 1),
+        userId
+    };
+}
+
+function buscarEventoPorId(idEvento, guildId = null) {
+    if (!idEvento) return null;
+    for (const [, evento] of eventosAtivos) {
+        if (evento?.id === idEvento && (!guildId || evento.guildId === guildId)) return evento;
+    }
+    return null;
+}
+
 function recarregarEventoDoDisco(idEvento) {
-    if (!fs.existsSync(EVENTOS_PATH)) return null;
+    if (!idEvento || !fs.existsSync(EVENTOS_PATH)) return null;
     try {
         const dados = JSON.parse(fs.readFileSync(EVENTOS_PATH, 'utf8'));
-        const evento = dados[idEvento];
+        let evento = dados[idEvento];
+        if (!evento) {
+            const entrada = Object.entries(dados).find(([, evt]) => evt?.id === idEvento);
+            if (entrada) evento = entrada[1];
+        }
         if (!evento?.id || !Array.isArray(evento.grupos)) return null;
         evento.grupos.forEach(grupo => normalizarGrupoPersistido(grupo));
-        eventosAtivos.set(idEvento, evento);
+        eventosAtivos.set(evento.id, evento);
         return evento;
     } catch (e) {
         console.error('Erro ao recarregar evento do disco:', e);
@@ -233,10 +331,12 @@ function buscarEventoPorMensagemPrincipal(messageId, guildId) {
 }
 
 function obterEvento(idEvento, interaction = null) {
-    let evento = eventosAtivos.get(idEvento);
+    if (!idEvento) return null;
+    const guildId = interaction?.guild?.id || null;
+    let evento = eventosAtivos.get(idEvento) || buscarEventoPorId(idEvento, guildId);
     if (!evento) evento = recarregarEventoDoDisco(idEvento);
-    if (!evento && interaction?.message?.id && interaction.guild?.id) {
-        evento = buscarEventoPorMensagemPrincipal(interaction.message.id, interaction.guild.id);
+    if (!evento && interaction?.message?.id && guildId) {
+        evento = buscarEventoPorMensagemPrincipal(interaction.message.id, guildId);
     }
     return evento;
 }
@@ -352,6 +452,39 @@ function formatarPercentual(valor) {
     return `${parsePercentualDesconto(valor).toLocaleString('pt-BR', { maximumFractionDigits: 2 })}%`;
 }
 
+function parseDescontoETaxaGuilda(texto, descontoPadrao = 20, taxaPadrao = 0) {
+    const partes = String(texto || '').split(/[|/,]/).map(item => item.trim()).filter(Boolean);
+    if (partes.length >= 2) {
+        return {
+            descontoPercentual: parsePercentualDesconto(partes[0], descontoPadrao),
+            taxaGuildaPercentual: parsePercentualDesconto(partes[1], taxaPadrao)
+        };
+    }
+    return {
+        descontoPercentual: parsePercentualDesconto(texto, descontoPadrao),
+        taxaGuildaPercentual: taxaPadrao
+    };
+}
+
+function calcularTaxaGuilda(valorBase, taxaPercentual) {
+    const base = Math.max(0, Math.floor(Number(valorBase) || 0));
+    const percentual = parsePercentualDesconto(taxaPercentual, 0);
+    return Math.floor(base * (percentual / 100));
+}
+
+function obterTotalTaxasGuilda(guildId) {
+    return taxasGuildaAcumulado.get(guildId) || 0;
+}
+
+function registrarTaxaGuildaAcumulada(guildId, valor) {
+    const incremento = Math.max(0, Math.floor(Number(valor) || 0));
+    if (incremento <= 0) return obterTotalTaxasGuilda(guildId);
+    const novoTotal = obterTotalTaxasGuilda(guildId) + incremento;
+    taxasGuildaAcumulado.set(guildId, novoTotal);
+    salvarDados();
+    return novoTotal;
+}
+
 function formatarPrata(valor) {
     return `${Math.max(0, Math.floor(Number(valor) || 0)).toLocaleString('pt-BR')} Pratas`;
 }
@@ -399,135 +532,216 @@ function criarEmbedsImagensBau(bau, titulo = 'Print do baú') {
     );
 }
 
-function chaveSaldo(guildId, userId) {
-    return `${guildId}_${userId}`;
+function pausar(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function normalizarSaldoMembro(saldo) {
-    const normalizado = {
-        guildId: saldo?.guildId || null,
-        userId: saldo?.userId || null,
-        lancamentos: Array.isArray(saldo?.lancamentos) ? saldo.lancamentos : [],
-        resgates: Array.isArray(saldo?.resgates) ? saldo.resgates : []
-    };
-
-    normalizado.lancamentos = normalizado.lancamentos.map(lancamento => ({
-        id: String(lancamento.id || ''),
-        guildId: lancamento.guildId || normalizado.guildId,
-        userId: lancamento.userId || normalizado.userId,
-        eventoId: lancamento.eventoId || null,
-        grupoIndex: Number.isInteger(lancamento.grupoIndex) ? lancamento.grupoIndex : parseInt(lancamento.grupoIndex ?? 0, 10),
-        tipo: lancamento.tipo || 'split',
-        descricao: lancamento.descricao || 'Split',
-        valor: Math.max(0, Math.floor(Number(lancamento.valor) || 0)),
-        status: lancamento.status || 'disponivel',
-        criadoEmMs: lancamento.criadoEmMs || Date.now(),
-        solicitadoEmMs: lancamento.solicitadoEmMs || null,
-        pagoEmMs: lancamento.pagoEmMs || null,
-        pagoPorId: lancamento.pagoPorId || null,
-        resgateId: lancamento.resgateId || null
-    })).filter(lancamento => lancamento.id);
-
-    normalizado.resgates = normalizado.resgates.map(resgate => ({
-        id: String(resgate.id || ''),
-        valorTotal: Math.max(0, Math.floor(Number(resgate.valorTotal) || 0)),
-        status: resgate.status || 'solicitado',
-        solicitadoEmMs: resgate.solicitadoEmMs || Date.now(),
-        pagoEmMs: resgate.pagoEmMs || null,
-        pagoPorId: resgate.pagoPorId || null,
-        lancamentoIds: Array.isArray(resgate.lancamentoIds) ? resgate.lancamentoIds : []
-    })).filter(resgate => resgate.id);
-
-    return normalizado;
+function formatarComandoSaldoIntegracao(userId, valor) {
+    const valorSplit = Math.max(0, Math.floor(Number(valor) || 0));
+    return `${COMANDO_SALDO_INTEGRACAO} ${userId} ${valorSplit}`.trim();
 }
 
-function obterSaldoMembro(guildId, userId) {
-    const chave = chaveSaldo(guildId, userId);
-    const existente = saldosMembros.get(chave);
-    if (existente) return existente;
-    const novo = { guildId, userId, lancamentos: [], resgates: [] };
-    saldosMembros.set(chave, novo);
-    return novo;
-}
+function obterEntradasSaldoIntegracao(evento, indexGrupo, tipoEvento) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
+    if (!grupo) return [];
 
-function idLancamentoSacola(eventoId, indexGrupo, userId) {
-    return `sacola_${eventoId}_${normalizarIndexGrupo(indexGrupo)}_${userId}`;
-}
-
-function idLancamentoBau(eventoId, indexGrupo, userId) {
-    return `bau_${eventoId}_${normalizarIndexGrupo(indexGrupo)}_${userId}`;
-}
-
-function registrarLancamentoSaldo(guildId, userId, lancamento) {
-    if (!lancamento?.id || !lancamento.valor) return null;
-    const saldo = obterSaldoMembro(guildId, userId);
-    const atual = saldo.lancamentos.find(item => item.id === lancamento.id);
-    if (atual) {
-        Object.assign(atual, { ...lancamento, status: atual.status, resgateId: atual.resgateId, solicitadoEmMs: atual.solicitadoEmMs, pagoEmMs: atual.pagoEmMs, pagoPorId: atual.pagoPorId });
-        return atual;
+    if (tipoEvento === 'split_bau') {
+        return (grupo.bau?.splitFinal?.resultados || [])
+            .filter(resultado => resultado?.userId && (resultado.valor || 0) > 0 && !resultado.integracaoSaldoEnviado)
+            .map(resultado => ({ userId: resultado.userId, valor: resultado.valor, resultadoRef: resultado }));
     }
-    const novo = {
-        guildId,
-        userId,
-        status: 'disponivel',
-        criadoEmMs: Date.now(),
-        solicitadoEmMs: null,
-        pagoEmMs: null,
-        pagoPorId: null,
-        resgateId: null,
-        ...lancamento
-    };
-    saldo.lancamentos.push(novo);
-    return novo;
+
+    if (tipoEvento === 'pagamento_sacola') {
+        return (grupo.splitSacolas?.resultados || [])
+            .filter(resultado => resultado?.userId && resultado.pago && (resultado.valor || 0) > 0 && !resultado.integracaoSaldoEnviado)
+            .map(resultado => ({ userId: resultado.userId, valor: resultado.valor, resultadoRef: resultado }));
+    }
+
+    return [];
 }
 
-function marcarLancamentoSaldoPago(guildId, userId, lancamentoId, pagoPorId) {
-    const saldo = obterSaldoMembro(guildId, userId);
-    const lancamento = saldo.lancamentos.find(item => item.id === lancamentoId);
-    if (!lancamento) return false;
-    lancamento.status = 'pago';
-    lancamento.pagoEmMs = Date.now();
-    lancamento.pagoPorId = pagoPorId;
-    if (lancamento.resgateId) {
-        const resgate = saldo.resgates.find(item => item.id === lancamento.resgateId);
-        const todosPagos = resgate?.lancamentoIds?.every(id => saldo.lancamentos.find(item => item.id === id)?.status === 'pago');
-        if (resgate && todosPagos) {
-            resgate.status = 'pago';
-            resgate.pagoEmMs = Date.now();
-            resgate.pagoPorId = pagoPorId;
+async function enviarComandosSaldoIntegracao(canal, entradas, contextoLog) {
+    const enviados = [];
+    const falhas = [];
+
+    for (let i = 0; i < entradas.length; i++) {
+        const entrada = entradas[i];
+        const comando = formatarComandoSaldoIntegracao(entrada.userId, entrada.valor);
+        const mensagem = await canal.send({ content: comando }).catch(error => {
+            console.error(`[integracao-saldo] Falha ao enviar ${comando} (${contextoLog}):`, error);
+            return null;
+        });
+
+        if (mensagem) {
+            enviados.push({ userId: entrada.userId, messageId: mensagem.id });
+            if (entrada.resultadoRef) entrada.resultadoRef.integracaoSaldoEnviado = true;
+        } else {
+            falhas.push(entrada.userId);
         }
+
+        if (i < entradas.length - 1) await pausar(INTERVALO_COMANDOS_SALDO_MS);
     }
-    return true;
+
+    return { enviados, falhas };
 }
 
-function registrarSplitSacolaNoSaldo(evento, indexGrupo, resultado) {
-    if (!resultado?.valor) return null;
+async function publicarReciboCanalIntegracao(guild, configGuild, evento, indexGrupo, tipoEvento) {
+    if (!eventoEhPelaGuilda(evento)) return { publicado: false, motivo: 'evento_fora_guilda' };
+    const config = configGuild || obterConfigGuild(guild?.id);
+    const channelId = config?.canalRecibosIntegracaoId;
+    if (!guild || !channelId) {
+        console.warn(`[integracao-saldo] Não publicado (${tipoEvento}): canalRecibosIntegracaoId ausente para guild ${guild?.id}`);
+        return { publicado: false, motivo: 'canal_nao_configurado' };
+    }
+
+    const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (!canal?.isTextBased?.()) {
+        console.warn(`[integracao-saldo] Canal inválido ${channelId} (${tipoEvento})`);
+        return { publicado: false, motivo: 'canal_invalido' };
+    }
+
     const idx = normalizarIndexGrupo(indexGrupo);
-    return registrarLancamentoSaldo(evento.guildId, resultado.userId, {
-        id: idLancamentoSacola(evento.id, idx, resultado.userId),
-        eventoId: evento.id,
-        grupoIndex: idx,
-        tipo: 'sacolas',
-        descricao: `Sacolas - ${evento.nome} | Grupo ${idx + 1}`,
-        valor: resultado.valor
-    });
+    const entradas = obterEntradasSaldoIntegracao(evento, idx, tipoEvento);
+    if (!entradas.length) {
+        return { publicado: false, motivo: 'sem_participantes', channelId: canal.id, comandosEnviados: 0 };
+    }
+
+    const { enviados, falhas } = await enviarComandosSaldoIntegracao(
+        canal,
+        entradas,
+        `${tipoEvento} evento ${evento.id} grupo ${idx + 1}`
+    );
+
+    if (enviados.length) {
+        salvarDados();
+        console.log(`[integracao-saldo] ${enviados.length} comando(s) (${tipoEvento}) evento ${evento.id} grupo ${idx + 1} em #${canal.name}`);
+    }
+
+    if (falhas.length) {
+        console.warn(`[integracao-saldo] ${falhas.length} falha(s) (${tipoEvento}) evento ${evento.id} grupo ${idx + 1}`);
+    }
+
+    return enviados.length
+        ? { publicado: true, channelId: canal.id, comandosEnviados: enviados.length, falhas: falhas.length }
+        : { publicado: false, motivo: 'falha_ao_enviar', channelId: canal.id, comandosEnviados: 0, falhas: falhas.length };
 }
 
-function registrarSplitBauNoSaldo(evento, indexGrupo, resultado, origem) {
-    if (!resultado?.valor) return null;
+async function publicarReciboCanalVisual(guild, configGuild, evento, indexGrupo, embedSplit, tipoEvento = 'split_sacolas') {
+    if (!eventoEhPelaGuilda(evento)) return { publicado: false, motivo: 'evento_fora_guilda' };
+    const config = configGuild || obterConfigGuild(guild?.id);
+    const channelId = config?.canalRecibosId;
+    if (!guild || !channelId) {
+        return { publicado: false, motivo: 'canal_nao_configurado' };
+    }
+
+    const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (!canal?.isTextBased?.()) {
+        console.warn(`[recibo-visual] Canal inválido ${channelId}`);
+        return { publicado: false, motivo: 'canal_invalido' };
+    }
+
     const idx = normalizarIndexGrupo(indexGrupo);
-    return registrarLancamentoSaldo(evento.guildId, resultado.userId, {
-        id: idLancamentoBau(evento.id, idx, resultado.userId),
-        eventoId: evento.id,
-        grupoIndex: idx,
-        tipo: 'bau',
-        descricao: `${origem || 'Baú'} - ${evento.nome} | Grupo ${idx + 1}`,
-        valor: resultado.valor
+    const mensagem = await canal.send({
+        content: `🧾 **Recibo** — ${evento.nome} · Grupo ${idx + 1} · \`${tipoEvento}\``,
+        embeds: [embedSplit]
+    }).catch(error => {
+        console.error('[recibo-visual] Erro ao publicar:', error);
+        return null;
     });
+
+    if (mensagem) {
+        console.log(`[recibo-visual] Publicado ${tipoEvento} evento ${evento.id} grupo ${idx + 1} em #${canal.name}`);
+    }
+
+    return mensagem
+        ? { publicado: true, channelId: canal.id, messageId: mensagem.id }
+        : { publicado: false, motivo: 'falha_ao_enviar' };
 }
 
-function marcarSacolaPagaNoSaldo(evento, indexGrupo, userId, pagoPorId) {
-    return marcarLancamentoSaldoPago(evento.guildId, userId, idLancamentoSacola(evento.id, indexGrupo, userId), pagoPorId);
+function montarPayloadReciboTaxaGuilda(evento, indexGrupo, source, dadosTaxa) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento.grupos[idx];
+    return {
+        schema: RECIBO_TAXA_GUILDA_SCHEMA,
+        marker: RECIBO_TAXA_GUILDA_MARCADOR,
+        source,
+        generatedAt: new Date().toISOString(),
+        guildId: evento.guildId,
+        amount: dadosTaxa.amount,
+        taxPercent: dadosTaxa.taxPercent,
+        baseValue: dadosTaxa.baseValue,
+        cumulativeTotal: dadosTaxa.cumulativeTotal,
+        event: {
+            id: evento.id,
+            name: evento.nome,
+            leaderId: evento.lider,
+            createdById: evento.criadoPorId,
+            groupNumber: idx + 1,
+            schedule: grupo?.horario || null
+        }
+    };
+}
+
+async function publicarReciboTaxaGuilda(guild, configGuild, evento, indexGrupo, source, dadosTaxa) {
+    const config = configGuild || obterConfigGuild(guild?.id);
+    const channelId = config?.canalTaxasGuildaId;
+    if (!guild || !channelId || !dadosTaxa?.amount) {
+        if (dadosTaxa?.amount > 0) {
+            console.warn(`[taxa-guilda] Não publicada (${source}): canalTaxasGuildaId ausente para guild ${guild?.id}`);
+        }
+        return { publicado: false, motivo: 'canal_nao_configurado' };
+    }
+
+    const canal = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (!canal?.isTextBased?.()) {
+        console.warn(`[taxa-guilda] Canal inválido ${channelId} (${source})`);
+        return { publicado: false, motivo: 'canal_invalido' };
+    }
+
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const payload = montarPayloadReciboTaxaGuilda(evento, idx, source, dadosTaxa);
+    const json = JSON.stringify(payload, null, 2);
+    const nomeArquivo = `flg-taxa-guilda-${evento.id}-g${idx + 1}-${source}.json`;
+
+    const mensagem = await canal.send({
+        content: `${RECIBO_TAXA_GUILDA_MARCADOR} ${RECIBO_TAXA_GUILDA_SCHEMA} | ${source} | +${formatarPrata(dadosTaxa.amount)} | acumulado:${formatarPrata(dadosTaxa.cumulativeTotal)} | evento:${evento.id} | grupo:${idx + 1}`,
+        files: [{ attachment: Buffer.from(json, 'utf8'), name: nomeArquivo }]
+    }).catch(error => {
+        console.error(`[taxa-guilda] Erro ao publicar (${source}):`, error);
+        return null;
+    });
+
+    if (mensagem) {
+        console.log(`[taxa-guilda] Publicada ${source} +${dadosTaxa.amount} (acumulado ${dadosTaxa.cumulativeTotal}) em #${canal.name}`);
+    }
+
+    return mensagem
+        ? { publicado: true, channelId: canal.id, messageId: mensagem.id }
+        : { publicado: false, motivo: 'falha_ao_enviar' };
+}
+
+async function registrarEPublicarTaxaGuilda(guild, configGuild, evento, indexGrupo, source, baseValue, taxPercent) {
+    if (!eventoEhPelaGuilda(evento)) return { registrado: false, amount: 0, acumuladoLocal: false, publicadoCanal: false, motivo: 'evento_fora_guilda' };
+    const amount = calcularTaxaGuilda(baseValue, taxPercent);
+    if (amount <= 0) return { registrado: false, amount: 0, acumuladoLocal: false, publicadoCanal: false };
+
+    const cumulativeTotal = registrarTaxaGuildaAcumulada(evento.guildId, amount);
+    const publicacao = await publicarReciboTaxaGuilda(guild, configGuild, evento, indexGrupo, source, {
+        amount,
+        taxPercent: parsePercentualDesconto(taxPercent, 0),
+        baseValue: Math.max(0, Math.floor(Number(baseValue) || 0)),
+        cumulativeTotal
+    });
+
+    return {
+        registrado: true,
+        acumuladoLocal: true,
+        publicadoCanal: publicacao.publicado,
+        amount,
+        cumulativeTotal,
+        ...publicacao
+    };
 }
 
 function obterSacolaTotal(grupo) {
@@ -553,6 +767,8 @@ function criarEstadoBauPadrao() {
         decisao: null,
         compradorId: null,
         valorPago: 0,
+        taxaGuildaPercentual: 0,
+        taxaGuildaValor: 0,
         splitFinal: null,
         leilao: null
     };
@@ -568,6 +784,9 @@ function normalizarSplitSacolasPersistido(splitSacolas) {
         resultado.xpGanho = Number(resultado.xpGanho) || 0;
     });
     splitSacolas.totalSacolas = Math.max(0, Math.floor(Number(splitSacolas.totalSacolas) || 0));
+    splitSacolas.totalParaSplit = Math.max(0, Math.floor(Number(splitSacolas.totalParaSplit ?? splitSacolas.totalSacolas) || 0));
+    splitSacolas.taxaGuildaPercent = parsePercentualDesconto(splitSacolas.taxaGuildaPercent, 0);
+    splitSacolas.taxaGuildaValor = Math.max(0, Math.floor(Number(splitSacolas.taxaGuildaValor) || 0));
     splitSacolas.totalMs = Math.max(0, Math.floor(Number(splitSacolas.totalMs) || 0));
     splitSacolas.falhasDmParticipantes = Array.isArray(splitSacolas.falhasDmParticipantes) ? splitSacolas.falhasDmParticipantes : [];
     return splitSacolas;
@@ -579,6 +798,8 @@ function normalizarBauPersistido(bau) {
     normalizado.valorReparo = Math.max(0, Math.floor(Number(normalizado.valorReparo) || 0));
     normalizado.valorLiquido = Math.max(0, Math.floor(Number(normalizado.valorLiquido ?? (normalizado.valorBruto - normalizado.valorReparo)) || 0));
     normalizado.valorPago = Math.max(0, Math.floor(Number(normalizado.valorPago) || 0));
+    normalizado.taxaGuildaPercentual = parsePercentualDesconto(normalizado.taxaGuildaPercentual, 0);
+    normalizado.taxaGuildaValor = Math.max(0, Math.floor(Number(normalizado.taxaGuildaValor) || 0));
     normalizado.localLoot = normalizado.localLoot ? limitarTexto(normalizado.localLoot, 80) : null;
     normalizado.descontoPercentual = parsePercentualDesconto(normalizado.descontoPercentual, 20);
     normalizado.printUrls = obterPrintUrlsBau(normalizado);
@@ -766,7 +987,8 @@ function gerarDashboardGrupo(evento, indexGrupo) {
 
     if (grupo.fechado) {
         embed.setColor('#7f8c8d');
-        embed.addFields({ name: '✅ Status', value: '*Split de sacolas fechado. Use o painel pós-fechamento para pagamentos e baú.*', inline: false });
+        const detalhePainel = eventoEhPelaGuilda(evento) ? 'pagamentos e baú' : 'baú';
+        embed.addFields({ name: '✅ Status', value: `*Split de sacolas fechado. Use o painel pós-fechamento para ${detalhePainel}.*`, inline: false });
         return { embeds: [embed], components: [] };
     }
 
@@ -783,6 +1005,10 @@ function usuarioPodeGerenciarEvento(interaction, evento) {
     return Boolean(evento && (interaction.user.id === evento.lider || interaction.user.id === evento.criadoPorId));
 }
 
+function eventoEhPelaGuilda(evento) {
+    return evento?.pelaGuilda !== false;
+}
+
 function gerarPainelLiderGrupo(evento, indexGrupo) {
     const idx = normalizarIndexGrupo(indexGrupo);
     const grupo = evento.grupos[idx];
@@ -790,7 +1016,7 @@ function gerarPainelLiderGrupo(evento, indexGrupo) {
         return { content: '❌ Este grupo não está disponível.', components: [], ephemeral: true };
     }
     if (grupo.fechado) {
-        return gerarPainelPagamentosGrupo(evento, idx);
+        return eventoEhPelaGuilda(evento) ? gerarPainelPagamentosGrupo(evento, idx) : gerarPainelBauGrupo(evento, idx);
     }
 
     const estadoConteudo = grupo.conteudoEstado || 'aguardando';
@@ -1048,9 +1274,12 @@ function calcularSplitValorPorTempo(grupo, valorTotal) {
     };
 }
 
-function gerarLinhasSplitSacolas(grupo) {
+function gerarLinhasSplitSacolas(grupo, incluirStatusPagamento = true) {
     const resultados = grupo.splitSacolas?.resultados || [];
     return resultados.map((resultado, index) => {
+        if (!incluirStatusPagamento) {
+            return `${index + 1}. <@${resultado.userId}> [${formatarDuracaoMs(resultado.tempoMs)}] ➜ **${formatarPrata(resultado.valor)}** *(+${Math.floor(resultado.xpGanho || 0)} XP)*`;
+        }
         const status = resultado.pago ? '[ ✅ PAGO ]' : '[ ⏳ PENDENTE ]';
         return `${index + 1}. ${status} <@${resultado.userId}> [${formatarDuracaoMs(resultado.tempoMs)}] ➜ **${formatarPrata(resultado.valor)}** *(+${Math.floor(resultado.xpGanho || 0)} XP)*`;
     });
@@ -1064,19 +1293,22 @@ function gerarEmbedRegistroEvento(evento, indexGrupo) {
     const idx = normalizarIndexGrupo(indexGrupo);
     const grupo = evento.grupos[idx];
     const split = grupo.splitSacolas;
+    const pelaGuilda = eventoEhPelaGuilda(evento);
     const embed = new EmbedBuilder()
         .setTitle(`⚖️ REGISTRO DO EVENTO - GRUPO ${idx + 1}`)
         .setColor(grupo.bau?.status === STATUS_LEILAO_ABERTO ? '#3498db' : grupo.bau?.status === STATUS_LEILAO_REVISAO ? '#f39c12' : '#f1c40f')
         .setDescription(
             `${textoRequisitosBuild(evento, configuracoesPorGuild.get(evento.guildId))}\n` +
-            `💰 **Sacolas/Prata Bruta:** ${formatarPrata(split?.totalSacolas ?? obterSacolaTotal(grupo))}\n` +
+            `💰 **Sacolas/Prata Bruta:** ${formatarPrata(split?.totalSacolas ?? obterSacolaTotal(grupo))}` +
+            (pelaGuilda && split?.taxaGuildaValor ? `\n🏛️ **Taxa da guilda (${formatarPercentual(split.taxaGuildaPercent)}):** ${formatarPrata(split.taxaGuildaValor)}` : '') +
+            `\n💵 **Total splitado entre a PT:** ${formatarPrata(split?.totalParaSplit ?? split?.totalSacolas ?? obterSacolaTotal(grupo))}\n` +
             `⏱️ **Soma do Tempo Total da PT:** ${formatarDuracaoMs(split?.totalMs || 0)}\n` +
             `📍 **Local do loot:** ${grupo.bau?.localLoot || 'não informado'}\n` +
             `📦 **Baú:** ${textoStatusBau(grupo)}\n\n` +
             '*Os pontos de XP foram adicionados à conta de cada membro no banco de dados.*'
         );
 
-    adicionarCampoLongo(embed, 'Checklist de Pagamentos — Sacolas', gerarLinhasSplitSacolas(grupo).join('\n') || 'Sem jogadores.');
+    adicionarCampoLongo(embed, pelaGuilda ? 'Checklist de Pagamentos — Sacolas' : 'Split de Sacolas', gerarLinhasSplitSacolas(grupo, pelaGuilda).join('\n') || 'Sem jogadores.');
 
     const printUrls = obterPrintUrlsBau(grupo.bau);
     if (printUrls[0]) embed.setImage(printUrls[0]);
@@ -1114,11 +1346,13 @@ function gerarEmbedsRegistroEvento(evento, indexGrupo) {
 
 function gerarComponentesAberturaPainelPosSplit(evento, indexGrupo) {
     const idx = normalizarIndexGrupo(indexGrupo);
+    const botoes = [];
+    if (eventoEhPelaGuilda(evento)) {
+        botoes.push(new ButtonBuilder().setCustomId(`dash_payment_panel_${evento.id}_${idx}`).setLabel('Painel de Pagamentos').setEmoji('✅').setStyle(ButtonStyle.Success));
+    }
+    botoes.push(new ButtonBuilder().setCustomId(`dash_bau_panel_${evento.id}_${idx}`).setLabel('Gerenciar Baú').setEmoji('📦').setStyle(ButtonStyle.Secondary));
     return [
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`dash_payment_panel_${evento.id}_${idx}`).setLabel('Painel de Pagamentos').setEmoji('✅').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`dash_bau_panel_${evento.id}_${idx}`).setLabel('Gerenciar Baú').setEmoji('📦').setStyle(ButtonStyle.Secondary)
-        )
+        new ActionRowBuilder().addComponents(botoes)
     ];
 }
 
@@ -1126,6 +1360,7 @@ function gerarPainelPagamentosGrupo(evento, indexGrupo) {
     const idx = normalizarIndexGrupo(indexGrupo);
     const grupo = evento.grupos[idx];
     const resultados = grupo?.splitSacolas?.resultados || [];
+    if (!eventoEhPelaGuilda(evento)) return { content: '❌ Este evento foi marcado como fora da guilda; o bot não gera registro de pagamento.', components: [], ephemeral: true };
     if (!grupo?.splitSacolas) return { content: '❌ O split de sacolas ainda não foi fechado para este grupo.', components: [], ephemeral: true };
 
     const linhas = gerarLinhasSplitSacolas(grupo);
@@ -1170,16 +1405,19 @@ function gerarPainelBauGrupo(evento, indexGrupo) {
     const grupo = evento.grupos[idx];
     if (!grupo?.splitSacolas) return { content: '❌ Feche primeiro o split de sacolas do grupo.', components: [], ephemeral: true };
     const bau = grupo.bau || criarEstadoBauPadrao();
+    const pelaGuilda = eventoEhPelaGuilda(evento);
     const linhas = [
         `📦 **Baú — Grupo ${idx + 1}**`,
         `Status: ${textoStatusBau(grupo)}`,
         `Local do loot: **${bau.localLoot || 'não informado'}**`,
         `Desconto do leilão: **${formatarPercentual(bau.descontoPercentual)}**`,
+        pelaGuilda && bau.taxaGuildaPercentual > 0 ? `Taxa da guilda: **${formatarPercentual(bau.taxaGuildaPercentual)}**` : null,
+        pelaGuilda && bau.taxaGuildaValor > 0 ? `Taxa da guilda retida: **${formatarPrata(bau.taxaGuildaValor)}**` : null,
         `Valor bruto: **${formatarPrata(bau.valorBruto)}**`,
         `Reparo: **${formatarPrata(bau.valorReparo)}**`,
         `Líquido estimado: **${formatarPrata(bau.valorLiquido)}**`,
         resumirPrintsBau(bau)
-    ];
+    ].filter(Boolean);
 
     if (bau.status === 'nao_informado' || bau.status === 'sem_bau') {
         return {
@@ -1214,7 +1452,7 @@ function gerarPainelBauGrupo(evento, indexGrupo) {
     return { content: linhas.join('\n'), components: [], ephemeral: true };
 }
 
-function criarModalBau(idEvento, indexGrupo, printUrl = '') {
+function criarModalBau(idEvento, indexGrupo, printUrl = '', bauAtual = null, pelaGuilda = true) {
     const inputPrint = new TextInputBuilder()
         .setCustomId('bau_print_url')
         .setLabel('URLs dos prints do baú')
@@ -1223,13 +1461,39 @@ function criarModalBau(idEvento, indexGrupo, printUrl = '') {
         .setRequired(false);
     if (printUrl) inputPrint.setValue(limitarTexto(printUrl, 4000));
 
+    const bau = bauAtual || criarEstadoBauPadrao();
+    const inputDescontoTaxa = new TextInputBuilder()
+        .setCustomId('bau_desconto')
+        .setLabel(pelaGuilda ? 'Desconto lance (%) | Taxa guilda (%)' : 'Desconto lance (%)')
+        .setPlaceholder(pelaGuilda ? 'Ex: 20 | 10' : 'Ex: 20')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(pelaGuilda ? `${bau.descontoPercentual ?? 20} | ${bau.taxaGuildaPercentual ?? 0}` : String(bau.descontoPercentual ?? 20));
+
     const modal = new ModalBuilder().setCustomId(`modal_bau_${idEvento}_${indexGrupo}`).setTitle('Dados do Baú');
     modal.addComponents(
         new ActionRowBuilder().addComponents(inputPrint),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_local').setLabel('Local onde o loot está').setPlaceholder('Ex: Brecilia, Thetford, Martlock...').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_bruto').setLabel('Valor total estimado do loot').setPlaceholder('Ex: 5.500.000').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_reparo').setLabel('Valor estimado do reparo').setPlaceholder('Ex: 350.000').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_desconto').setLabel('Desconto para lance inicial (%)').setPlaceholder('Ex: 20 para 20%').setStyle(TextInputStyle.Short).setRequired(true))
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_local').setLabel('Local onde o loot está').setPlaceholder('Ex: Brecilia, Thetford, Martlock...').setStyle(TextInputStyle.Short).setRequired(true).setValue(bau.localLoot || '')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_bruto').setLabel('Valor total estimado do loot').setPlaceholder('Ex: 5.500.000').setStyle(TextInputStyle.Short).setRequired(true).setValue(bau.valorBruto > 0 ? String(bau.valorBruto) : '')),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bau_valor_reparo').setLabel('Valor estimado do reparo').setPlaceholder('Ex: 350.000').setStyle(TextInputStyle.Short).setRequired(true).setValue(bau.valorReparo > 0 ? String(bau.valorReparo) : '')),
+        new ActionRowBuilder().addComponents(inputDescontoTaxa)
+    );
+    return modal;
+}
+
+function criarModalCalcSplitSacolas(idEvento, indexGrupo, grupo) {
+    const totalAtual = formatarPrata(obterSacolaTotal(grupo));
+    const modal = new ModalBuilder().setCustomId(`modal_calc_split_${idEvento}_${indexGrupo}`).setTitle('Finalizar Split de Sacolas');
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+                .setCustomId('taxa_guilda')
+                .setLabel('Taxa da guilda sobre as sacolas (%)')
+                .setPlaceholder(`Total atual: ${totalAtual}. Ex: 10 para 10%`)
+                .setStyle(TextInputStyle.Short)
+                .setRequired(false)
+                .setValue('0')
+        )
     );
     return modal;
 }
@@ -1421,61 +1685,6 @@ async function atualizarRegistroEvento(guild, evento, indexGrupo) {
     }
 }
 
-function obterLeiloesAtivosUsuario(guildId, userId) {
-    const leiloes = [];
-    for (const [, evento] of eventosAtivos) {
-        if (evento.guildId !== guildId) continue;
-        evento.grupos.forEach((grupo, index) => {
-            if (grupo?.bau?.status !== STATUS_LEILAO_ABERTO) return;
-            if (!grupo.participantes?.some(p => p.id === userId)) return;
-            leiloes.push({
-                eventoNome: evento.nome,
-                grupo: index + 1,
-                localLoot: grupo.bau.localLoot || 'não informado',
-                lanceAtual: grupo.bau.leilao?.maiorLance || grupo.bau.leilao?.lanceInicial || 0,
-                channelId: grupo.bau.leilao?.channelId || null
-            });
-        });
-    }
-    return leiloes;
-}
-
-function linhasLancamentosSaldo(lancamentos, limite = 8) {
-    const lista = lancamentos.slice(-limite).reverse();
-    return lista.map(item => `• **${formatarPrata(item.valor)}** — ${item.descricao}`);
-}
-
-function gerarEmbedSaldo(guildId, userId) {
-    const saldo = obterSaldoMembro(guildId, userId);
-    const disponiveis = saldo.lancamentos.filter(item => item.status === 'disponivel' && item.valor > 0);
-    const solicitados = saldo.lancamentos.filter(item => item.status === 'solicitado' && item.valor > 0);
-    const pagos = saldo.lancamentos.filter(item => item.status === 'pago' && item.valor > 0);
-    const leiloes = obterLeiloesAtivosUsuario(guildId, userId);
-    const totalDisponivel = disponiveis.reduce((acc, item) => acc + item.valor, 0);
-    const totalSolicitado = solicitados.reduce((acc, item) => acc + item.valor, 0);
-
-    const embed = new EmbedBuilder()
-        .setTitle('💼 Seu saldo de splits')
-        .setColor(totalDisponivel > 0 ? '#2ecc71' : '#95a5a6')
-        .setDescription(`Saldo disponível para resgate: **${formatarPrata(totalDisponivel)}**\nResgates aguardando pagamento: **${formatarPrata(totalSolicitado)}**`);
-
-    adicionarCampoLongo(embed, 'Disponível para resgate', linhasLancamentosSaldo(disponiveis).join('\n') || 'Nada disponível no momento.');
-    adicionarCampoLongo(embed, 'Pendente de pagamento', linhasLancamentosSaldo(solicitados).join('\n') || 'Nenhum resgate solicitado.');
-    adicionarCampoLongo(embed, 'Em leilão', leiloes.map(item => `• ${item.eventoNome} | Grupo ${item.grupo} | ${item.localLoot} | ${item.channelId ? `<#${item.channelId}>` : 'canal não localizado'} | referência: **${formatarPrata(item.lanceAtual)}**`).join('\n') || 'Nenhum baú seu está em leilão agora.');
-    adicionarCampoLongo(embed, 'Últimos pagos', linhasLancamentosSaldo(pagos, 5).join('\n') || 'Nenhum pagamento registrado.');
-    return embed;
-}
-
-function gerarComponentesSaldo(guildId, userId) {
-    const saldo = obterSaldoMembro(guildId, userId);
-    const totalDisponivel = saldo.lancamentos
-        .filter(item => item.status === 'disponivel' && item.valor > 0)
-        .reduce((acc, item) => acc + item.valor, 0);
-    return totalDisponivel > 0
-        ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`saldo_resgate_${guildId}_${userId}`).setLabel('Solicitar Resgate').setEmoji('💸').setStyle(ButtonStyle.Success))]
-        : [];
-}
-
 async function enviarDmResponsaveisLeilao(guild, configGuild, payload) {
     if (!guild || !configGuild?.cargoLeilaoId) return 0;
     const membros = guild.members.cache.filter(membro => membro.roles.cache.has(configGuild.cargoLeilaoId) && !membro.user.bot);
@@ -1544,117 +1753,8 @@ async function enviarLeilaoParaRevisao(guild, evento, indexGrupo, motivo = 'praz
     return true;
 }
 
-async function solicitarResgateSaldo(interaction, guildId, userId) {
-    if (interaction.user.id !== userId) {
-        return interaction.reply({ content: '❌ Você só pode solicitar resgate do seu próprio saldo.', ephemeral: true });
-    }
-
-    const guild = interaction.guild || client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
-    const configGuild = configuracoesPorGuild.get(guildId);
-    if (!configGuild?.cargoLeilaoId) {
-        return interaction.reply({ content: '❌ O cargo responsável por leilões/resgates ainda não foi configurado em /configuracoes.', ephemeral: true });
-    }
-
-    const saldo = obterSaldoMembro(guildId, userId);
-    const disponiveis = saldo.lancamentos.filter(item => item.status === 'disponivel' && item.valor > 0);
-    if (disponiveis.length === 0) {
-        return interaction.update({ embeds: [gerarEmbedSaldo(guildId, userId)], components: gerarComponentesSaldo(guildId, userId) });
-    }
-    await interaction.deferUpdate();
-
-    const resgateId = Date.now().toString();
-    const valorTotal = disponiveis.reduce((acc, item) => acc + item.valor, 0);
-    disponiveis.forEach(item => {
-        item.status = 'solicitado';
-        item.solicitadoEmMs = Date.now();
-        item.resgateId = resgateId;
-    });
-    saldo.resgates.push({
-        id: resgateId,
-        valorTotal,
-        status: 'solicitado',
-        solicitadoEmMs: Date.now(),
-        pagoEmMs: null,
-        pagoPorId: null,
-        lancamentoIds: disponiveis.map(item => item.id)
-    });
-    salvarDados();
-
-    const embedPedido = new EmbedBuilder()
-        .setTitle('💸 Solicitação de resgate')
-        .setColor('#f1c40f')
-        .setDescription(`<@${userId}> solicitou resgate de **${formatarPrata(valorTotal)}**.`)
-        .addFields({ name: 'Itens incluídos', value: dividirTextoDiscord(disponiveis.map(item => `• ${item.descricao}: **${formatarPrata(item.valor)}**`).join('\n'), 1024)[0] })
-        .setFooter({ text: `Resgate ID: ${resgateId}` });
-    const componentes = [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`saldo_pagar_${guildId}_${userId}_${resgateId}`).setLabel('Marcar como Pago').setEmoji('✅').setStyle(ButtonStyle.Success))];
-
-    if (interaction.channel?.send) {
-        await interaction.channel.send({
-            content: `<@&${configGuild.cargoLeilaoId}> novo resgate solicitado por <@${userId}>.`,
-            embeds: [embedPedido],
-            components: componentes,
-            allowedMentions: { roles: [configGuild.cargoLeilaoId], users: [userId] }
-        }).catch(() => null);
-    }
-
-    const dmsEnviadas = await enviarDmResponsaveisLeilao(guild, configGuild, { embeds: [embedPedido], components: componentes });
-    await enviarDmUsuario(userId, { embeds: [new EmbedBuilder().setTitle('✅ Resgate solicitado').setColor('#2ecc71').setDescription(`Seu pedido de **${formatarPrata(valorTotal)}** foi enviado para o cargo responsável.`)] });
-
-    return interaction.editReply({
-        content: `✅ Resgate solicitado. DMs enviadas aos responsáveis: **${dmsEnviadas}**.`,
-        embeds: [gerarEmbedSaldo(guildId, userId)],
-        components: gerarComponentesSaldo(guildId, userId)
-    });
-}
-
-async function marcarResgateComoPago(interaction, guildId, userId, resgateId) {
-    const guild = interaction.guild || client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
-    const podeOperar = await usuarioPodeOperarLeilao(interaction, guildId);
-    if (!podeOperar) return interaction.reply({ content: '❌ Apenas o cargo responsável por leilões/resgates pode marcar este resgate como pago.', ephemeral: true });
-
-    const saldo = obterSaldoMembro(guildId, userId);
-    const resgate = saldo.resgates.find(item => item.id === resgateId);
-    if (!resgate) return interaction.reply({ content: '❌ Resgate não encontrado.', ephemeral: true });
-    if (resgate.status === 'pago') return interaction.reply({ content: '✅ Este resgate já estava marcado como pago.', ephemeral: true });
-    await interaction.deferUpdate();
-
-    resgate.status = 'pago';
-    resgate.pagoEmMs = Date.now();
-    resgate.pagoPorId = interaction.user.id;
-
-    const eventosParaAtualizar = new Set();
-    saldo.lancamentos.forEach(lancamento => {
-        if (lancamento.resgateId !== resgateId) return;
-        lancamento.status = 'pago';
-        lancamento.pagoEmMs = Date.now();
-        lancamento.pagoPorId = interaction.user.id;
-        if (lancamento.tipo === 'sacolas' && lancamento.eventoId) {
-            const evento = eventosAtivos.get(lancamento.eventoId);
-            const grupo = evento?.grupos?.[normalizarIndexGrupo(lancamento.grupoIndex)];
-            const resultado = grupo?.splitSacolas?.resultados?.find(item => item.userId === userId);
-            if (resultado) {
-                resultado.pago = true;
-                resultado.pagoEmMs = Date.now();
-                resultado.pagoPorId = interaction.user.id;
-                eventosParaAtualizar.add(`${lancamento.eventoId}_${normalizarIndexGrupo(lancamento.grupoIndex)}`);
-            }
-        }
-    });
-
-    salvarDados();
-    for (const chave of eventosParaAtualizar) {
-        const [eventoId, grupoIndex] = chave.split('_');
-        const evento = eventosAtivos.get(eventoId);
-        if (evento && guild) await atualizarRegistroEvento(guild, evento, grupoIndex);
-    }
-
-    await enviarDmUsuario(userId, { embeds: [new EmbedBuilder().setTitle('✅ Resgate pago').setColor('#2ecc71').setDescription(`Seu resgate de **${formatarPrata(resgate.valorTotal)}** foi marcado como pago por <@${interaction.user.id}>.`)] });
-    const resposta = { content: `✅ Resgate de <@${userId}> marcado como pago: **${formatarPrata(resgate.valorTotal)}**.`, components: [] };
-    return interaction.editReply(resposta);
-}
-
 function gerarMenuRoles(idEvento, indexGrupo) {
-    const evento = eventosAtivos.get(idEvento); const grupo = evento?.grupos[indexGrupo]; const options = [];
+    const evento = obterEvento(idEvento); const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)]; const options = [];
     if (!evento || !grupo || grupo.fechado) {
         options.push({ label: 'Evento indisponível', value: 'UNAVAILABLE' });
         return new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`select_role_${idEvento}_${indexGrupo}`).setPlaceholder('Escolha sua função...').addOptions(options));
@@ -1668,7 +1768,7 @@ function gerarMenuRoles(idEvento, indexGrupo) {
 function gerarMenuArmas(idEvento, indexGrupo, role) {
     const idx = normalizarIndexGrupo(indexGrupo);
     const roleSlug = roleParaSlug(role);
-    const evento = eventosAtivos.get(idEvento); const grupo = evento?.grupos[idx];
+    const evento = obterEvento(idEvento); const grupo = evento?.grupos[idx];
     if (!evento || !grupo || grupo.fechado || !evento.composicao[role]) {
         return new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`select_weapon_${idEvento}_${idx}_${roleSlug}`).setPlaceholder('Escolha sua arma...').addOptions([{ label: 'Evento indisponível', value: 'UNAVAILABLE' }]));
     }
@@ -1842,9 +1942,11 @@ async function estenderRetencaoRegistroLeilao(guild, grupo) {
 }
 
 async function criarCanalRegistroSplit(guild, evento, indexGrupo, embedSplit, configGuild) {
-    if (!configGuild?.categoriaRegistrosId) return { criado: false, motivo: 'categoria_nao_configurada' };
+    if (!eventoEhPelaGuilda(evento)) return { criado: false, motivo: 'evento_fora_guilda' };
+    const config = configGuild || obterConfigGuild(guild?.id);
+    if (!config?.categoriaRegistrosId) return { criado: false, motivo: 'categoria_nao_configurada' };
 
-    const categoria = guild.channels.cache.get(configGuild.categoriaRegistrosId) || await guild.channels.fetch(configGuild.categoriaRegistrosId).catch(() => null);
+    const categoria = guild.channels.cache.get(config.categoriaRegistrosId) || await guild.channels.fetch(config.categoriaRegistrosId).catch(() => null);
     if (!categoria || categoria.type !== ChannelType.GuildCategory) return { criado: false, motivo: 'categoria_invalida' };
 
     const apagarEmMs = Date.now() + TEMPO_RETENCAO_REGISTROS_MS;
@@ -1876,6 +1978,129 @@ async function criarCanalRegistroSplit(guild, evento, indexGrupo, embedSplit, co
     salvarDados();
     agendarExclusaoCanalRegistro(registro);
     return { criado: true, canalId: canalRegistro.id, messageId: mensagemRegistro.id };
+}
+
+async function finalizarSplitSacolas(interaction, evento, indexGrupo, taxaGuildaPercent = 0) {
+    const idx = normalizarIndexGrupo(indexGrupo);
+    const grupo = evento?.grupos?.[idx];
+    if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+    if (!grupo || grupo.fechado) return interaction.reply({ content: '❌ Este split já foi fechado.', ephemeral: true });
+
+    const pelaGuilda = eventoEhPelaGuilda(evento);
+    const taxaGuildaPercentNormalizada = pelaGuilda ? parsePercentualDesconto(taxaGuildaPercent, 0) : 0;
+    const totalSacolasBruto = obterSacolaTotal(grupo);
+    const taxaGuildaValor = pelaGuilda ? calcularTaxaGuilda(totalSacolasBruto, taxaGuildaPercentNormalizada) : 0;
+    const totalParaSplit = Math.max(0, totalSacolasBruto - taxaGuildaValor);
+    if (totalParaSplit <= 0) {
+        return interaction.reply({ content: '❌ A taxa da guilda consome todo o valor das sacolas. Ajuste a taxa ou o total informado.', ephemeral: true });
+    }
+
+    const totalMsGeral = grupo.participantes.reduce((acc, p) => acc + p.totalMs, 0);
+    if (totalMsGeral === 0) {
+        return interaction.reply({ content: '❌ Tempo zerado para calcular o split.', ephemeral: true });
+    }
+
+    const duracaoTotalTexto = formatarDuracaoMs(tempoConteudoAtual(grupo));
+    await interaction.deferReply({ ephemeral: true });
+    const falhasDmParticipantes = [];
+
+    const resultadosSplit = await Promise.all(grupo.participantes.map(async (p) => {
+        const fraction = p.totalMs / totalMsGeral;
+        const ganho = Math.floor(totalParaSplit * fraction);
+
+        const horasJogadas = p.totalMs / (1000 * 60 * 60);
+        const xpGanho = horasJogadas * 50;
+
+        const chaveBanco = obterChaveXp(interaction.guild.id, p.id);
+        const xpAntigo = xpMembros.get(chaveBanco) || 0;
+        xpMembros.set(chaveBanco, xpAntigo + xpGanho);
+
+        const dmEmbed = new EmbedBuilder()
+            .setTitle(`💰 Recibo de Raid & XP: ${evento.nome}`)
+            .setColor('#f1c40f')
+            .setDescription(`O split de **Sacolas/Prata Bruta** do **Grupo ${idx + 1}** foi realizado. O baú será tratado separadamente pelo líder.`)
+            .addFields(
+                { name: '⚙️ Tier', value: `\`${valorCampoExibicao(evento.tierEquipamento)}\``, inline: true },
+                { name: '📊 IP', value: `\`${valorCampoExibicao(evento.ipBuild)}\``, inline: true },
+                { name: '⏱️ Tempo da Raid', value: duracaoTotalTexto, inline: true },
+                { name: '⌛ Seu Tempo Ativo', value: formatarDuracaoMs(p.totalMs), inline: true },
+                { name: '⚡ XP Adquirido', value: `**+${Math.floor(xpGanho)} XP**`, inline: true },
+                { name: '💎 Sacolas a Receber', value: `**${formatarPrata(ganho)}**`, inline: false }
+            );
+        if (taxaGuildaValor > 0) {
+            dmEmbed.addFields({ name: '🏛️ Taxa da guilda', value: `**${formatarPercentual(taxaGuildaPercentNormalizada)}** (${formatarPrata(taxaGuildaValor)} retidos do total)`, inline: false });
+        }
+        dmEmbed.setFooter({ text: 'Use o comando /ranking no servidor para ver o Placar do Mês!' });
+
+        const dmEnviada = await enviarDmUsuario(p.id, { embeds: [dmEmbed] });
+        if (!dmEnviada) falhasDmParticipantes.push(p.id);
+
+        return {
+            userId: p.id,
+            tempoMs: p.totalMs,
+            valor: ganho,
+            xpGanho,
+            pago: false,
+            pagoEmMs: null,
+            pagoPorId: null
+        };
+    }));
+
+    grupo.fechado = true;
+    grupo.fechadoEmMs = Date.now();
+    grupo.splitSacolas = {
+        totalSacolas: totalSacolasBruto,
+        totalParaSplit,
+        taxaGuildaPercent: taxaGuildaPercentNormalizada,
+        taxaGuildaValor,
+        totalMs: totalMsGeral,
+        calculadoEmMs: Date.now(),
+        calculadoPorId: interaction.user.id,
+        falhasDmParticipantes,
+        resultados: resultadosSplit
+    };
+    grupo.bau = normalizarBauPersistido(grupo.bau);
+    salvarDados();
+
+    const embedSplit = gerarEmbedRegistroEvento(evento, idx);
+    const dmLiderEnviada = await enviarDmUsuario(evento.lider, { embeds: [embedSplit] });
+    const configGuild = obterConfigGuild(interaction.guild.id);
+    const reciboVisual = pelaGuilda
+        ? await publicarReciboCanalVisual(interaction.guild, configGuild, evento, idx, embedSplit, 'split_sacolas')
+        : null;
+    const taxaGuilda = pelaGuilda
+        ? await registrarEPublicarTaxaGuilda(interaction.guild, configGuild, evento, idx, 'sacolas', totalSacolasBruto, taxaGuildaPercentNormalizada)
+        : null;
+    const registroSplit = pelaGuilda
+        ? await criarCanalRegistroSplit(interaction.guild, evento, idx, embedSplit, configGuild).catch(error => {
+            console.error('Erro ao criar canal de registro do split:', error);
+            return { criado: false, motivo: 'erro_ao_criar' };
+        })
+        : null;
+
+    if (registroSplit?.criado) {
+        grupo.splitSacolas.registroChannelId = registroSplit.canalId;
+        grupo.splitSacolas.registroMessageId = registroSplit.messageId;
+    }
+
+    const msgRelatorio = await interaction.channel.send({
+        embeds: gerarEmbedsRegistroEvento(evento, idx),
+        components: gerarComponentesAberturaPainelPosSplit(evento, idx)
+    });
+    grupo.splitSacolas.relatorioChannelId = interaction.channel.id;
+    grupo.splitSacolas.relatorioMessageId = msgRelatorio.id;
+    salvarDados();
+
+    await atualizarMsgDashboard(interaction.guild, evento, idx);
+    const textoTaxaGuilda = taxaGuildaValor > 0
+        ? `\n${textoMotivoPublicacao(taxaGuilda, 'Taxa guilda (JSON)')} · Acumulado total: **${formatarPrata(taxaGuilda.cumulativeTotal)}**.`
+        : '';
+    const textoPublicacaoGuilda = pelaGuilda
+        ? `\n${textoMotivoPublicacao(reciboVisual, 'Recibo visual')}. ${textoMotivoPublicacao(registroSplit, 'Registro temporário')}.${textoTaxaGuilda}\n💰 Ao marcar pagamentos no checklist, o bot enviará \`${COMANDO_SALDO_INTEGRACAO} <id> <valor>\` no canal de integração para cada participante pago.`
+        : '\nEvento fora da guilda: sem taxa, sem registro de pagamento e sem integração de saldo.';
+    return interaction.editReply({
+        content: `✅ Split de sacolas concluído. DM do líder: **${dmLiderEnviada ? 'enviada' : 'não entregue'}**. DMs dos participantes com falha: **${falhasDmParticipantes.length}**.${textoPublicacaoGuilda}\n📦 Agora use **Gerenciar Baú** no relatório para informar print, valor bruto e reparo.`
+    });
 }
 
 function gerarEmbedEventoEncerrado(userId, detalhe = 'Todas as salas vinculadas a este evento foram apagadas e os dados foram salvos.') {
@@ -1939,6 +2164,7 @@ const comandoEvento = new SlashCommandBuilder()
     .addStringOption(opt => opt.setName('ip_build').setDescription('IP: 1450 ou null se usar só Tier').setRequired(true))
     .addStringOption(opt => opt.setName('horarios').setDescription('Ex: 13:00, 14:00...').setRequired(true))
     .addStringOption(opt => opt.setName('titulo_build').setDescription('Título no fórum de builds. Ex: Baú Dourado - 01').setRequired(true))
+    .addBooleanOption(opt => opt.setName('pela_guilda').setDescription('Este evento é pela guilda?').setRequired(true))
     .addStringOption(opt => opt.setName('armas_tank').setDescription('Ex: Maça, Fura-Bruma3').setRequired(false))
     .addStringOption(opt => opt.setName('armas_healer').setDescription('Ex: Sagrado, Natureza2').setRequired(false))
     .addStringOption(opt => opt.setName('armas_suporte').setDescription('Ex: Chama-sombra').setRequired(false))
@@ -1952,31 +2178,29 @@ const comandoConfiguracoes = new SlashCommandBuilder()
     .addChannelOption(opt => opt.setName('categoria_canais').setDescription('Categoria').addChannelTypes(ChannelType.GuildCategory).setRequired(true))
     .addRoleOption(opt => opt.setName('cargo_evento').setDescription('Cargo permitido').setRequired(true))
     .addChannelOption(opt => opt.setName('categoria_registros').setDescription('Categoria onde os relatórios finais temporários serão guardados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
+    .addChannelOption(opt => opt.setName('canal_recibos').setDescription('Canal de texto onde o recibo visual (embed) será publicado').addChannelTypes(ChannelType.GuildText).setRequired(false))
     .addChannelOption(opt => opt.setName('categoria_leiloes').setDescription('Categoria onde os canais temporários de leilão serão criados').addChannelTypes(ChannelType.GuildCategory).setRequired(false))
-    .addRoleOption(opt => opt.setName('cargo_leiloes').setDescription('Cargo responsável por vendas, leilões e resgates').setRequired(false))
+    .addRoleOption(opt => opt.setName('cargo_leiloes').setDescription('Cargo responsável por vendas e leilões').setRequired(false))
+    .addChannelOption(opt => opt.setName('canal_recibos_integracao').setDescription('Canal onde comandos de saldo (ex.: p!m) serão enviados para outro bot').addChannelTypes(ChannelType.GuildText).setRequired(false))
+    .addChannelOption(opt => opt.setName('canal_taxas_guilda').setDescription('Canal de registro das taxas da guilda (saldo acumulado em JSON)').addChannelTypes(ChannelType.GuildText).setRequired(false))
     .addChannelOption(opt => opt.setName('canal_forum_builds').setDescription('Canal fórum das builds (Conteúdo - 01, Baú Dourado - 01...)').addChannelTypes(ChannelType.GuildForum).setRequired(false));
 
 const comandoRanking = new SlashCommandBuilder()
     .setName('ranking')
     .setDescription('Mostra o Top 10 membros com mais XP de atividade no mês');
 
-const comandoSaldo = new SlashCommandBuilder()
-    .setName('saldo')
-    .setDescription('Consulta seus splits, leilões pendentes e saldo disponível para resgate');
-
 const COMANDOS_SLASH_JSON = [
     comandoEvento.toJSON(),
     comandoConfiguracoes.toJSON(),
-    comandoRanking.toJSON(),
-    comandoSaldo.toJSON()
+    comandoRanking.toJSON()
 ];
 
 async function registrarComandosSlash(rest, guildIds = []) {
     const opcoesEvento = (comandoEvento.toJSON().options || []).map(opt => opt.name);
     console.log(`📋 Opções do /evento (${opcoesEvento.length}): ${opcoesEvento.join(', ')}`);
 
-    if (!opcoesEvento.includes('tier_equipamento') || !opcoesEvento.includes('ip_build') || !opcoesEvento.includes('titulo_build')) {
-        throw new Error('Definição do comando /evento inválida: faltam tier_equipamento, ip_build ou titulo_build');
+    if (!opcoesEvento.includes('tier_equipamento') || !opcoesEvento.includes('ip_build') || !opcoesEvento.includes('titulo_build') || !opcoesEvento.includes('pela_guilda')) {
+        throw new Error('Definição do comando /evento inválida: faltam tier_equipamento, ip_build, titulo_build ou pela_guilda');
     }
 
     const idsServidores = new Set(guildIds);
@@ -2102,32 +2326,27 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [embedRank] });
     }
 
-    // COMANDO /SALDO
-    if (interaction.isChatInputCommand() && interaction.commandName === 'saldo') {
-        const guildId = interaction.guild.id;
-        const userId = interaction.user.id;
-        return interaction.reply({
-            embeds: [gerarEmbedSaldo(guildId, userId)],
-            components: gerarComponentesSaldo(guildId, userId),
-            ephemeral: true
-        });
-    }
-
     // COMANDO /CONFIGURACOES
     if (interaction.isChatInputCommand() && interaction.commandName === 'configuracoes') {
         const categoria = interaction.options.getChannel('categoria_canais');
         const cargoEvento = interaction.options.getRole('cargo_evento');
         const categoriaRegistros = interaction.options.getChannel('categoria_registros');
+        const canalRecibos = interaction.options.getChannel('canal_recibos');
         const categoriaLeiloes = interaction.options.getChannel('categoria_leiloes');
         const cargoLeiloes = interaction.options.getRole('cargo_leiloes');
+        const canalRecibosIntegracao = interaction.options.getChannel('canal_recibos_integracao');
+        const canalTaxasGuilda = interaction.options.getChannel('canal_taxas_guilda');
         const canalForumBuilds = interaction.options.getChannel('canal_forum_builds');
-        const configAtual = configuracoesPorGuild.get(interaction.guild.id) || {};
+        const configAtual = obterConfigGuild(interaction.guild.id) || {};
         configuracoesPorGuild.set(interaction.guild.id, {
             categoriaId: categoria.id,
             cargoEventoId: cargoEvento.id,
             categoriaRegistrosId: categoriaRegistros?.id || configAtual.categoriaRegistrosId || null,
+            canalRecibosId: canalRecibos?.id || configAtual.canalRecibosId || null,
             categoriaLeiloesId: categoriaLeiloes?.id || configAtual.categoriaLeiloesId || null,
             cargoLeilaoId: cargoLeiloes?.id || configAtual.cargoLeilaoId || null,
+            canalRecibosIntegracaoId: canalRecibosIntegracao?.id || configAtual.canalRecibosIntegracaoId || null,
+            canalTaxasGuildaId: canalTaxasGuilda?.id || configAtual.canalTaxasGuildaId || null,
             canalForumBuildsId: canalForumBuilds?.id || configAtual.canalForumBuildsId || null,
             atualizadoPorId: interaction.user.id
         });
@@ -2135,6 +2354,9 @@ client.on('interactionCreate', async interaction => {
         const textoRegistros = categoriaRegistros
             ? `\n📁 Categoria de registros: <#${categoriaRegistros.id}>`
             : (configAtual.categoriaRegistrosId ? `\n📁 Categoria de registros mantida: <#${configAtual.categoriaRegistrosId}>` : '\n📁 Categoria de registros: não configurada');
+        const textoCanalRecibos = canalRecibos
+            ? `\n🧾 Canal de recibos (visual): <#${canalRecibos.id}>`
+            : (configAtual.canalRecibosId ? `\n🧾 Canal de recibos (visual) mantido: <#${configAtual.canalRecibosId}>` : '\n🧾 Canal de recibos (visual): não configurado');
         const textoForum = canalForumBuilds
             ? `\n📚 Fórum de builds: <#${canalForumBuilds.id}>`
             : (configAtual.canalForumBuildsId ? `\n📚 Fórum de builds mantido: <#${configAtual.canalForumBuildsId}>` : '\n📚 Fórum de builds: não configurado (configure para link na DM)');
@@ -2142,9 +2364,15 @@ client.on('interactionCreate', async interaction => {
             ? `\n🏷️ Categoria de leilões: <#${categoriaLeiloes.id}>`
             : (configAtual.categoriaLeiloesId ? `\n🏷️ Categoria de leilões mantida: <#${configAtual.categoriaLeiloesId}>` : '\n🏷️ Categoria de leilões: não configurada');
         const textoCargoLeiloes = cargoLeiloes
-            ? `\n🧾 Cargo responsável por leilões/resgates: <@&${cargoLeiloes.id}>`
-            : (configAtual.cargoLeilaoId ? `\n🧾 Cargo responsável por leilões/resgates mantido: <@&${configAtual.cargoLeilaoId}>` : '\n🧾 Cargo responsável por leilões/resgates: não configurado');
-        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoLeiloes}${textoCargoLeiloes}${textoForum}`, ephemeral: true });
+            ? `\n🧾 Cargo responsável por leilões: <@&${cargoLeiloes.id}>`
+            : (configAtual.cargoLeilaoId ? `\n🧾 Cargo responsável por leilões mantido: <@&${configAtual.cargoLeilaoId}>` : '\n🧾 Cargo responsável por leilões: não configurado');
+        const textoRecibosIntegracao = canalRecibosIntegracao
+            ? `\n🤖 Canal de recibos (integração): <#${canalRecibosIntegracao.id}>`
+            : (configAtual.canalRecibosIntegracaoId ? `\n🤖 Canal de recibos (integração) mantido: <#${configAtual.canalRecibosIntegracaoId}>` : '\n🤖 Canal de recibos (integração): não configurado');
+        const textoTaxasGuilda = canalTaxasGuilda
+            ? `\n🏛️ Canal de taxas da guilda: <#${canalTaxasGuilda.id}>`
+            : (configAtual.canalTaxasGuildaId ? `\n🏛️ Canal de taxas da guilda mantido: <#${configAtual.canalTaxasGuildaId}>` : '\n🏛️ Canal de taxas da guilda: não configurado');
+        return interaction.reply({ content: `✅ Configurações salvas!${textoRegistros}${textoCanalRecibos}${textoLeiloes}${textoCargoLeiloes}${textoRecibosIntegracao}${textoTaxasGuilda}${textoForum}`, ephemeral: true });
     }
 
     // COMANDO /EVENTO
@@ -2171,6 +2399,7 @@ client.on('interactionCreate', async interaction => {
                 ephemeral: true
             });
         }
+        const pelaGuilda = interaction.options.getBoolean('pela_guilda') !== false;
         const horariosRaw = interaction.options.getString('horarios').split(',').map(h => h.trim()).filter(h => h !== '');
         const horariosInvalidos = horariosRaw.filter(h => !horarioValido(h));
         if (horariosInvalidos.length > 0) return interaction.reply({ content: `❌ Horário inválido: ${horariosInvalidos.join(', ')}. Use o formato HH:MM, por exemplo 13:00.`, ephemeral: true });
@@ -2199,6 +2428,7 @@ client.on('interactionCreate', async interaction => {
 
         const novoEvento = {
             id: idEvento, nome, tierEquipamento, ipBuild, tituloBuildForum, lider: lider.id, criadoPorId: interaction.user.id, guildId: interaction.guild.id, categoriaId: configGuild.categoriaId,
+            pelaGuilda,
             composicao, totalVagas, grupos, criadoEmMs: Date.now(), inicioPrevistoMs: iniciosPrevistosGrupos.length ? Math.min(...iniciosPrevistosGrupos) : null,
             inicioAtivoMs: null, mensagemPrincipalId: null, canalMensagemId: interaction.channel.id
         };
@@ -2217,9 +2447,9 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ content: `Você escolheu o **Grupo ${parseInt(interaction.values[0]) + 1}**. Classe:`, components: [gerarMenuRoles(idEvento, interaction.values[0])], ephemeral: true });
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('select_role_')) {
-        const partes = interaction.customId.split('_');
-        const idEvento = partes[2];
-        const indexGrupo = partes[3];
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'select_role_');
+        if (!parsed) return interaction.update({ content: '❌ Interação inválida.', components: [] });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!evento || !grupo || grupo.fechado) return interaction.update({ content: '❌ Este grupo não está disponível.', components: [] });
@@ -2269,7 +2499,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: INICIAR / PAUSAR / RETOMAR CONTEÚDO (LÍDER)
     if (interaction.isButton() && interaction.customId.startsWith('dash_conteudo_timer_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_conteudo_timer_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) {
@@ -2298,7 +2530,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: ABRIR PAINEL PRIVADO DO LÍDER
     if (interaction.isButton() && interaction.customId.startsWith('dash_leader_panel_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_leader_panel_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode abrir este painel.', ephemeral: true });
@@ -2307,7 +2541,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: PAUSAR MEU TEMPO
     if (interaction.isButton() && interaction.customId.startsWith('dash_pause_self_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_pause_self_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!grupo || grupo.fechado) return interaction.reply({ content: '❌ Este grupo não está disponível.', ephemeral: true });
@@ -2325,7 +2561,9 @@ client.on('interactionCreate', async interaction => {
 
     // MENU: FORÇAR PAUSE (Líder)
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('dash_force_pause_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_force_pause_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Negado.', ephemeral: true });
@@ -2346,7 +2584,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: ADICIONAR SACOLAS (MODAL)
     if (interaction.isButton() && interaction.customId.startsWith('dash_add_loot_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_add_loot_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Apenas o Líder.', ephemeral: true });
@@ -2361,7 +2601,9 @@ client.on('interactionCreate', async interaction => {
 
     // RECEBIMENTO DO MODAL DE SACOLAS
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_sacolas_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_sacolas_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!evento || !grupo || grupo.fechado) return interaction.reply({ content: '❌ Este grupo já foi fechado ou não está disponível.', ephemeral: true });
@@ -2374,7 +2616,9 @@ client.on('interactionCreate', async interaction => {
 
     // BOTÃO: CALCULAR SPLIT DE SACOLAS, DM E XP
     if (interaction.isButton() && interaction.customId.startsWith('dash_calc_split_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_calc_split_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Apenas o Líder.', ephemeral: true });
@@ -2394,108 +2638,45 @@ client.on('interactionCreate', async interaction => {
                 ephemeral: true
             });
         }
-
-        const duracaoTotalTexto = formatarDuracaoMs(tempoConteudoAtual(grupo));
-        await interaction.reply({ content: '⏳ Processando o split de sacolas, adicionando XP e enviando os recibos na DM...', ephemeral: true });
-        const falhasDmParticipantes = [];
-        const totalSacolas = obterSacolaTotal(grupo);
-
-        const resultadosSplit = await Promise.all(grupo.participantes.map(async (p) => {
-            const fraction = p.totalMs / totalMsGeral;
-            const ganho = Math.floor(totalSacolas * fraction);
-
-            // CÁLCULO DE XP (50 XP por hora)
-            const horasJogadas = p.totalMs / (1000 * 60 * 60);
-            const xpGanho = horasJogadas * 50;
-
-            const chaveBanco = obterChaveXp(interaction.guild.id, p.id);
-            const xpAntigo = xpMembros.get(chaveBanco) || 0;
-            xpMembros.set(chaveBanco, xpAntigo + xpGanho);
-
-            const dmEmbed = new EmbedBuilder()
-                .setTitle(`💰 Recibo de Raid & XP: ${evento.nome}`)
-                .setColor('#f1c40f')
-                .setDescription(`O split de **Sacolas/Prata Bruta** do **Grupo ${parseInt(indexGrupo) + 1}** foi realizado. O baú será tratado separadamente pelo líder.`)
-                .addFields(
-                    { name: '⚙️ Tier', value: `\`${valorCampoExibicao(evento.tierEquipamento)}\``, inline: true },
-                    { name: '📊 IP', value: `\`${valorCampoExibicao(evento.ipBuild)}\``, inline: true },
-                    { name: '⏱️ Tempo da Raid', value: duracaoTotalTexto, inline: true },
-                    { name: '⌛ Seu Tempo Ativo', value: formatarDuracaoMs(p.totalMs), inline: true },
-                    { name: '⚡ XP Adquirido', value: `**+${Math.floor(xpGanho)} XP**`, inline: true },
-                    { name: '💎 Sacolas a Receber', value: `**${formatarPrata(ganho)}**`, inline: false }
-                )
-                .setFooter({ text: 'Use o comando /ranking no servidor para ver o Placar do Mês!' });
-
-            const dmEnviada = await enviarDmUsuario(p.id, { embeds: [dmEmbed] });
-            if (!dmEnviada) falhasDmParticipantes.push(p.id);
-
-            return {
-                userId: p.id,
-                tempoMs: p.totalMs,
-                valor: ganho,
-                xpGanho,
-                pago: false,
-                pagoEmMs: null,
-                pagoPorId: null
-            };
-        }));
-
-        grupo.fechado = true;
-        grupo.fechadoEmMs = Date.now();
-        grupo.splitSacolas = {
-            totalSacolas,
-            totalMs: totalMsGeral,
-            calculadoEmMs: Date.now(),
-            calculadoPorId: interaction.user.id,
-            falhasDmParticipantes,
-            resultados: resultadosSplit
-        };
-        resultadosSplit.forEach(resultado => registrarSplitSacolaNoSaldo(evento, indexGrupo, resultado));
-        grupo.bau = normalizarBauPersistido(grupo.bau);
-        salvarDados();
-
-        const embedSplit = gerarEmbedRegistroEvento(evento, indexGrupo);
-
-        const dmLiderEnviada = await enviarDmUsuario(evento.lider, { embeds: [embedSplit] });
-        const configGuild = configuracoesPorGuild.get(interaction.guild.id);
-        const registroSplit = await criarCanalRegistroSplit(interaction.guild, evento, indexGrupo, embedSplit, configGuild).catch(error => {
-            console.error('Erro ao criar canal de registro do split:', error);
-            return { criado: false, motivo: 'erro_ao_criar' };
-        });
-
-        if (registroSplit.criado) {
-            grupo.splitSacolas.registroChannelId = registroSplit.canalId;
-            grupo.splitSacolas.registroMessageId = registroSplit.messageId;
+        if (obterSacolaTotal(grupo) <= 0) {
+            return interaction.reply({ content: '❌ Informe o valor das sacolas antes de finalizar o split.', ephemeral: true });
         }
 
-        const msgRelatorio = await interaction.channel.send({
-            embeds: gerarEmbedsRegistroEvento(evento, indexGrupo),
-            components: gerarComponentesAberturaPainelPosSplit(evento, indexGrupo)
-        });
-        grupo.splitSacolas.relatorioChannelId = interaction.channel.id;
-        grupo.splitSacolas.relatorioMessageId = msgRelatorio.id;
         salvarDados();
+        if (!eventoEhPelaGuilda(evento)) return finalizarSplitSacolas(interaction, evento, indexGrupo, 0);
+        return interaction.showModal(criarModalCalcSplitSacolas(idEvento, indexGrupo, grupo));
+    }
 
-        await atualizarMsgDashboard(interaction.guild, evento, indexGrupo);
-        await interaction.followUp({
-            content: `✅ Split de sacolas concluído. DM do líder: **${dmLiderEnviada ? 'enviada' : 'não entregue'}**. DMs dos participantes com falha: **${falhasDmParticipantes.length}**. Registro: **${registroSplit.criado ? `criado em <#${registroSplit.canalId}>` : 'não criado'}**.\n📦 Agora use **Gerenciar Baú** no relatório para informar print, valor bruto e reparo.`,
-            ephemeral: true
-        });
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_calc_split_')) {
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_calc_split_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
+        const evento = obterEvento(idEvento, interaction);
+        if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (interaction.user.id !== evento.lider && interaction.user.id !== evento.criadoPorId) return interaction.reply({ content: '❌ Apenas o Líder.', ephemeral: true });
+        const taxaGuildaPercent = parsePercentualDesconto(interaction.fields.getTextInputValue('taxa_guilda'), 0);
+        return finalizarSplitSacolas(interaction, evento, indexGrupo, taxaGuildaPercent);
     }
 
     // PAINEL PÓS-FECHAMENTO: PAGAMENTOS DE SACOLAS
     if (interaction.isButton() && interaction.customId.startsWith('dash_payment_panel_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_payment_panel_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!eventoEhPelaGuilda(evento)) return interaction.reply({ content: '❌ Este evento foi marcado como fora da guilda; não há registro de pagamento para abrir.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode abrir este painel.', ephemeral: true });
         return interaction.reply(gerarPainelPagamentosGrupo(evento, indexGrupo));
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_pay_sacola_')) {
-        const [, , , idEvento, indexGrupo, userId] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupoEUserId(interaction.customId, 'dash_pay_sacola_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo, userId } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!eventoEhPelaGuilda(evento)) return interaction.reply({ content: '❌ Este evento foi marcado como fora da guilda; o bot não registra pagamentos.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode confirmar pagamentos.', ephemeral: true });
         const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
         const resultado = grupo?.splitSacolas?.resultados?.find(item => item.userId === userId);
@@ -2503,16 +2684,23 @@ client.on('interactionCreate', async interaction => {
         resultado.pago = true;
         resultado.pagoEmMs = Date.now();
         resultado.pagoPorId = interaction.user.id;
-        marcarSacolaPagaNoSaldo(evento, indexGrupo, userId, interaction.user.id);
         salvarDados();
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        const configGuild = obterConfigGuild(interaction.guild.id);
+        const integracaoSaldo = await publicarReciboCanalIntegracao(interaction.guild, configGuild, evento, indexGrupo, 'pagamento_sacola');
+        if (!integracaoSaldo.publicado && integracaoSaldo.motivo !== 'sem_participantes') {
+            console.warn(`[integracao-saldo] Pagamento individual sem integração: ${integracaoSaldo.motivo}`);
+        }
         return interaction.update(gerarPainelPagamentosGrupo(evento, indexGrupo));
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_pay_all_sacola_')) {
-        const [, , , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_pay_all_sacola_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
+        if (!eventoEhPelaGuilda(evento)) return interaction.reply({ content: '❌ Este evento foi marcado como fora da guilda; o bot não registra pagamentos.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode confirmar pagamentos.', ephemeral: true });
         const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!grupo?.splitSacolas) return interaction.reply({ content: '❌ Checklist de sacolas não encontrado.', ephemeral: true });
@@ -2521,17 +2709,23 @@ client.on('interactionCreate', async interaction => {
                 resultado.pago = true;
                 resultado.pagoEmMs = Date.now();
                 resultado.pagoPorId = interaction.user.id;
-                marcarSacolaPagaNoSaldo(evento, indexGrupo, resultado.userId, interaction.user.id);
             }
         });
         salvarDados();
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        const configGuild = obterConfigGuild(interaction.guild.id);
+        const integracaoSaldo = await publicarReciboCanalIntegracao(interaction.guild, configGuild, evento, indexGrupo, 'pagamento_sacola');
+        if (!integracaoSaldo.publicado && integracaoSaldo.motivo !== 'sem_participantes') {
+            console.warn(`[integracao-saldo] Pagamento em lote sem integração: ${integracaoSaldo.motivo}`);
+        }
         return interaction.update(gerarPainelPagamentosGrupo(evento, indexGrupo));
     }
 
     // PAINEL PÓS-FECHAMENTO: BAÚ
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_panel_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_panel_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2539,16 +2733,20 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_informar_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_informar_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
         const grupo = evento.grupos[normalizarIndexGrupo(indexGrupo)];
-        return interaction.showModal(criarModalBau(idEvento, indexGrupo, obterPrintUrlsBau(grupo?.bau).join('\n')));
+        return interaction.showModal(criarModalBau(idEvento, indexGrupo, obterPrintUrlsBau(grupo?.bau).join('\n'), grupo?.bau, eventoEhPelaGuilda(evento)));
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_ultimo_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_ultimo_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2562,11 +2760,13 @@ client.on('interactionCreate', async interaction => {
             await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
             return interaction.update(gerarPainelBauGrupo(evento, indexGrupo));
         }
-        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrls.join('\n')));
+        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrls.join('\n'), grupo?.bau, eventoEhPelaGuilda(evento)));
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_coletar_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_coletar_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2580,11 +2780,13 @@ client.on('interactionCreate', async interaction => {
             await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
             return interaction.update(gerarPainelBauGrupo(evento, indexGrupo));
         }
-        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrls.join('\n')));
+        return interaction.showModal(criarModalBau(idEvento, indexGrupo, printUrls.join('\n'), grupo?.bau, eventoEhPelaGuilda(evento)));
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_sem_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_sem_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2596,7 +2798,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_bau_') && !interaction.customId.startsWith('modal_bau_buyout_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_bau_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2608,14 +2812,20 @@ client.on('interactionCreate', async interaction => {
         const printUrls = normalizarPrintUrls(printTexto);
         if (printTexto && printUrls.length === 0) return interaction.reply({ content: '❌ Nenhum link de imagem válido foi encontrado no campo de prints.', ephemeral: true });
         const localLoot = limitarTexto(String(interaction.fields.getTextInputValue('bau_local') || '').trim(), 80);
-        const descontoPercentual = parsePercentualDesconto(interaction.fields.getTextInputValue('bau_desconto'), 20);
+        const dadosDescontoTaxa = eventoEhPelaGuilda(evento)
+            ? parseDescontoETaxaGuilda(interaction.fields.getTextInputValue('bau_desconto'), 20, 0)
+            : {
+                descontoPercentual: parsePercentualDesconto(interaction.fields.getTextInputValue('bau_desconto'), 20),
+                taxaGuildaPercentual: 0
+            };
         grupo.bau = {
             ...criarEstadoBauPadrao(),
             status: 'aguardando_decisao',
             printUrl: printUrls[0] || null,
             printUrls,
             localLoot,
-            descontoPercentual,
+            descontoPercentual: dadosDescontoTaxa.descontoPercentual,
+            taxaGuildaPercentual: dadosDescontoTaxa.taxaGuildaPercentual,
             valorBruto,
             valorReparo,
             valorLiquido: Math.max(0, valorBruto - valorReparo),
@@ -2628,7 +2838,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_buyout_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_buyout_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2638,7 +2850,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_bau_buyout_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_bau_buyout_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode gerenciar o baú.', ephemeral: true });
@@ -2651,15 +2865,23 @@ client.on('interactionCreate', async interaction => {
         const valorPago = parseValorPrata(interaction.fields.getTextInputValue('bau_valor_pago'));
         if (valorPago <= 0) return interaction.reply({ content: '❌ Informe um valor pago maior que zero.', ephemeral: true });
 
-        const splitFinal = calcularSplitValorPorTempo(grupo, valorPago);
+        const pelaGuilda = eventoEhPelaGuilda(evento);
+        const taxaGuildaPercentual = pelaGuilda ? (grupo.bau.taxaGuildaPercentual || 0) : 0;
+        const taxaGuildaValor = calcularTaxaGuilda(valorPago, taxaGuildaPercentual);
+        const valorParaSplit = Math.max(0, valorPago - taxaGuildaValor);
+        if (valorParaSplit <= 0) {
+            return interaction.reply({ content: '❌ A taxa da guilda consome todo o valor pago do baú. Ajuste a taxa ou o valor informado.', ephemeral: true });
+        }
+
+        const splitFinal = calcularSplitValorPorTempo(grupo, valorParaSplit);
         grupo.bau.status = 'comprado_interno';
         grupo.bau.decisao = 'buyout';
         grupo.bau.compradorId = compradorId;
         grupo.bau.valorPago = valorPago;
+        grupo.bau.taxaGuildaValor = taxaGuildaValor;
         grupo.bau.splitFinal = splitFinal;
         grupo.bau.encerradoEmMs = Date.now();
         grupo.bau.encerradoPorId = interaction.user.id;
-        splitFinal.resultados.forEach(resultado => registrarSplitBauNoSaldo(evento, indexGrupo, resultado, 'Baú compra interna'));
         salvarDados();
 
         for (const resultado of splitFinal.resultados) {
@@ -2675,12 +2897,22 @@ client.on('interactionCreate', async interaction => {
         }
 
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        const embedRegistro = gerarEmbedRegistroEvento(evento, indexGrupo);
+        if (pelaGuilda) {
+            const configGuildBuyout = obterConfigGuild(interaction.guild.id);
+            await publicarReciboCanalVisual(interaction.guild, configGuildBuyout, evento, indexGrupo, embedRegistro, 'split_bau');
+            await publicarReciboCanalIntegracao(interaction.guild, configGuildBuyout, evento, indexGrupo, 'split_bau');
+            await registrarEPublicarTaxaGuilda(interaction.guild, configGuildBuyout, evento, indexGrupo, 'bau', valorPago, taxaGuildaPercentual);
+        }
         await interaction.channel.send({ embeds: gerarEmbedsRegistroEvento(evento, indexGrupo) }).catch(() => null);
-        return interaction.reply({ content: `✅ Compra interna registrada. O baú foi splitado em **${formatarPrata(valorPago)}**.`, ephemeral: true });
+        const textoTaxa = taxaGuildaValor > 0 ? ` Taxa da guilda retida: **${formatarPrata(taxaGuildaValor)}**.` : '';
+        return interaction.reply({ content: `✅ Compra interna registrada. O baú foi splitado em **${formatarPrata(valorParaSplit)}**.${textoTaxa}`, ephemeral: true });
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('dash_bau_leilao_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'dash_bau_leilao_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (!usuarioPodeGerenciarEvento(interaction, evento)) return interaction.reply({ content: '❌ Apenas o líder ou criador do evento pode enviar o baú para leilão.', ephemeral: true });
@@ -2747,7 +2979,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('auction_bid_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'auction_bid_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         const leilao = grupo?.bau?.leilao;
@@ -2763,7 +2997,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_auction_bid_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_auction_bid_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         const leilao = grupo?.bau?.leilao;
@@ -2804,7 +3040,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('auction_review_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'auction_review_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         if (!evento || grupo?.bau?.status !== STATUS_LEILAO_REVISAO || !grupo.bau.leilao) return interaction.reply({ content: '❌ Este leilão não está em revisão.', ephemeral: true });
@@ -2813,7 +3051,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_auction_review_')) {
-        const [, , , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'modal_auction_review_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         const bau = grupo?.bau;
@@ -2865,7 +3105,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('auction_reopen_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'auction_reopen_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         const grupo = evento?.grupos[normalizarIndexGrupo(indexGrupo)];
         const bau = grupo?.bau;
@@ -2899,7 +3141,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('auction_close_')) {
-        const [, , idEvento, indexGrupo] = interaction.customId.split('_');
+        const parsed = extrairIdEventoEIndexGrupo(interaction.customId, 'auction_close_');
+        if (!parsed) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
+        const { idEvento, indexGrupo } = parsed;
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         const ehAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
@@ -2913,15 +3157,23 @@ client.on('interactionCreate', async interaction => {
         if (grupo?.bau?.status !== STATUS_LEILAO_ABERTO || !leilao) return interaction.reply({ content: '❌ Este leilão não está ativo.', ephemeral: true });
         if (!leilao.maiorLance || !leilao.maiorLicitanteId) return interaction.reply({ content: '❌ Ainda não há lance para encerrar este leilão.', ephemeral: true });
 
-        const splitFinal = calcularSplitValorPorTempo(grupo, leilao.maiorLance);
+        const pelaGuilda = eventoEhPelaGuilda(evento);
+        const taxaGuildaPercentual = pelaGuilda ? (grupo.bau.taxaGuildaPercentual || 0) : 0;
+        const taxaGuildaValor = calcularTaxaGuilda(leilao.maiorLance, taxaGuildaPercentual);
+        const valorParaSplit = Math.max(0, leilao.maiorLance - taxaGuildaValor);
+        if (valorParaSplit <= 0) {
+            return interaction.reply({ content: '❌ A taxa da guilda consome todo o valor do leilão. Ajuste a taxa antes de encerrar.', ephemeral: true });
+        }
+
+        const splitFinal = calcularSplitValorPorTempo(grupo, valorParaSplit);
         grupo.bau.status = STATUS_LEILAO_VENDIDO;
         grupo.bau.decisao = 'leilao';
         grupo.bau.compradorId = leilao.maiorLicitanteId;
         grupo.bau.valorPago = leilao.maiorLance;
+        grupo.bau.taxaGuildaValor = taxaGuildaValor;
         grupo.bau.splitFinal = splitFinal;
         grupo.bau.encerradoEmMs = Date.now();
         grupo.bau.encerradoPorId = interaction.user.id;
-        splitFinal.resultados.forEach(resultado => registrarSplitBauNoSaldo(evento, indexGrupo, resultado, 'Baú leiloado'));
         salvarDados();
 
         await atualizarMensagemLeilao(interaction.guild, evento, indexGrupo);
@@ -2940,27 +3192,27 @@ client.on('interactionCreate', async interaction => {
         }
 
         await atualizarRegistroEvento(interaction.guild, evento, indexGrupo);
+        const embedRegistro = gerarEmbedRegistroEvento(evento, indexGrupo);
+        if (pelaGuilda) {
+            const configGuildLeilao = obterConfigGuild(interaction.guild.id);
+            await publicarReciboCanalVisual(interaction.guild, configGuildLeilao, evento, indexGrupo, embedRegistro, 'split_bau');
+            await publicarReciboCanalIntegracao(interaction.guild, configGuildLeilao, evento, indexGrupo, 'split_bau');
+            await registrarEPublicarTaxaGuilda(interaction.guild, configGuildLeilao, evento, indexGrupo, 'bau', leilao.maiorLance, taxaGuildaPercentual);
+        }
         await interaction.channel.send({ embeds: gerarEmbedsRegistroEvento(evento, indexGrupo) }).catch(() => null);
-        return interaction.reply({ content: `✅ Leilão encerrado por **${formatarPrata(leilao.maiorLance)}**. Registro atualizado.`, ephemeral: true });
-    }
-
-    // SALDO: SOLICITAÇÃO E PAGAMENTO DE RESGATE
-    if (interaction.isButton() && interaction.customId.startsWith('saldo_resgate_')) {
-        const resto = interaction.customId.slice('saldo_resgate_'.length);
-        const [guildId, userId] = resto.split('_');
-        return solicitarResgateSaldo(interaction, guildId, userId);
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith('saldo_pagar_')) {
-        const resto = interaction.customId.slice('saldo_pagar_'.length);
-        const [guildId, userId, resgateId] = resto.split('_');
-        return marcarResgateComoPago(interaction, guildId, userId, resgateId);
+        const textoTaxa = taxaGuildaValor > 0 ? ` Taxa da guilda retida: **${formatarPrata(taxaGuildaValor)}**.` : '';
+        return interaction.reply({ content: `✅ Leilão encerrado por **${formatarPrata(leilao.maiorLance)}**. Split da PT: **${formatarPrata(valorParaSplit)}**.${textoTaxa}`, ephemeral: true });
     }
 
     // BOTÃO: SAIR DO EVENTO
     if (interaction.isButton() && (interaction.customId.startsWith('dash_leave_') || interaction.customId.startsWith('leave_all_'))) {
         const isDash = interaction.customId.startsWith('dash_leave_');
-        const idEvento = isDash ? interaction.customId.split('_')[2] : extrairIdEvento(interaction.customId, 'leave_all_');
+        const parsed = isDash
+            ? extrairIdEventoEIndexGrupo(interaction.customId, 'dash_leave_')
+            : null;
+        const idEvento = isDash ? parsed?.idEvento : extrairIdEvento(interaction.customId, 'leave_all_');
+        const indexGrupoDash = parsed?.indexGrupo;
+        if (!idEvento) return interaction.reply({ content: '❌ Interação inválida.', ephemeral: true });
         const evento = obterEvento(idEvento, interaction);
         if (!evento) return interaction.reply({ content: '❌ Este evento não está mais ativo.', ephemeral: true });
         if (evento) {
@@ -2968,7 +3220,7 @@ client.on('interactionCreate', async interaction => {
                 grupo.participantes = grupo.participantes.filter(p => p.id !== interaction.user.id);
                 if (grupo.canalVozId) await interaction.guild.channels.cache.get(grupo.canalVozId)?.permissionOverwrites.delete(interaction.user.id).catch(()=>null);
                 if (grupo.canalTextoId) await interaction.guild.channels.cache.get(grupo.canalTextoId)?.permissionOverwrites.delete(interaction.user.id).catch(()=>null);
-                if (isDash && parseInt(interaction.customId.split('_')[3]) === index) await atualizarMsgDashboard(interaction.guild, evento, index);
+                if (isDash && normalizarIndexGrupo(indexGrupoDash) === index) await atualizarMsgDashboard(interaction.guild, evento, index);
             }
             await atualizarMensagemPrincipalEvento(interaction.guild, evento);
             salvarDados();
